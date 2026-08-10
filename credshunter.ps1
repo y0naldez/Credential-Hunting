@@ -117,6 +117,8 @@ param(
 
     [switch] $Quiet,
 
+    [switch] $Clean,
+
     [switch] $NoColor,
 
     [Alias('h','?')]
@@ -145,6 +147,7 @@ Usage: .\credshunter.ps1 -Path <dir>[,<dir>] [options]
   -SkipSystem          Skip stage 1 (OS checks); alias -NoStage1
   -NoStage1..5         Skip an individual stage
   -Quiet               Reduce status noise
+  -Clean               Console-friendly final summary, suppress stage detail
   -NoColor             Strip colour codes
   -Help                Show this help (-h)
 
@@ -453,6 +456,8 @@ $script:RawPatterns = @(
        Regex = '(?i)public\s+\$(password|smtppass|dbpass|secret)\s*=\s*[''"][^''"]{2,}' }
     @{ Label = 'drupal_password';
        Regex = "(?i)['""]password['""][ \t]*=>\s*['""][^'""]{4,}" }
+    @{ Label = 'php_array_secret';
+       Regex = "(?i)['""](?:[A-Za-z0-9_.-]+[_\-.])?(password|passwd|pwd|pass|secret|token|auth|api[_-]?key|client[_-]?secret|db[_-]?pass(word)?|database[_-]?pass(word)?|redis[_-]?pass|smtp[_-]?pass)['""][ \t]*=>\s*['""][^'""]{3,}" }
     # Generic PHP define() for any *PASSWORD/*PASS/*PWD/*SECRET constant.
     @{ Label = 'define_secret';
        Regex = '(?i)define\s*\(\s*["''][A-Za-z0-9_]*(PASSWORD|PASSWD|PWD|PASS|SECRET)["'']\s*,\s*["''][^"'']{3,}' }
@@ -721,6 +726,9 @@ $script:Stage2Extensions = @(
     '.jks','.keystore','.truststore'
     '.bek','.fve','.keytab','.dpapimk'
 )
+$script:EncryptedLeadExtensions = @(
+    '.axx','.enc','.encrypted','.aes','.gpg','.pgp'
+)
 
 # -- Stage 3 -- high-value file types (match = [INTEREST]) -------------------
 # Three sub-arrays drive the Stage 3 detector: extensions, exact filenames,
@@ -744,7 +752,9 @@ $script:Stage3Extensions = @(
     # Packet captures (may contain plaintext auth)
     '.pcap','.pcapng'
     # Compressed archives (admin backups often contain creds)
-    '.tar','.tgz','.gz','.zip','.7z'
+    '.tar','.tgz','.gz','.zip','.7z','.rar'
+    # Windows shell shortcuts can point at credential containers/recent files.
+    '.lnk'
 )
 
 # Exact filename matches (names that cannot be expressed as a simple *.ext glob)
@@ -807,7 +817,7 @@ $script:Stage5Extensions = @(
     '.htaccess'
     '.dsn','.udl','.ora','.tns'
     '.reg','.rdp','.rdg','.rdcman','.inf','.unattend','.answerfile'
-    '.ovpn','.openvpn','.vnc','.rdc','.tcc','.ica','.session','.script','.kix'
+    '.ovpn','.openvpn','.vnc','.rdc','.tcc','.ica','.session','.sublime_session','.script','.kix'
     '.txt','.text','.log','.logs'
     '.bak','.backup','.old','.orig','.original','.save','.saved','.tmp','.temp'
     '.ldif','.ldiff'
@@ -823,7 +833,7 @@ $script:Stage5Extensions = @(
     # .NET / Visual Studio project & publish files (conn strings, deploy creds)
     '.resx','.resw','.pubxml','.publishsettings'
     # Windows scripting / app / shortcut formats
-    '.hta','.au3','.url'
+    '.hta','.au3','.url','.code-workspace','.sublime-project','.sublime-workspace'
     # VPN / network configuration
     '.nmconnection','.wg','.pcf','.mobileconfig'
     # Database scripts / ORM schemas
@@ -850,6 +860,8 @@ if ($IncludeData) {
 # Stage-3 hot loop doesn't ToLowerInvariant() a constant on every file.
 $script:Stage2ExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]$script:Stage2Extensions, [System.StringComparer]::OrdinalIgnoreCase)
+$script:EncryptedLeadExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]$script:EncryptedLeadExtensions, [System.StringComparer]::OrdinalIgnoreCase)
 $script:Stage3ExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]$script:Stage3Extensions, [System.StringComparer]::OrdinalIgnoreCase)
 $script:Stage3GlobPatternsLower = @($script:Stage3GlobPatterns | ForEach-Object { $_.ToLowerInvariant() })
@@ -1192,7 +1204,7 @@ function End-Stage { param([int]$N, [string]$Title)
     $elapsedStr = $elapsed.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture)
     Write-Host ("     $($script:CD){0} found in {1}s$($script:CNC)" -f $total, $elapsedStr)
 
-    if (-not $Quiet -and $total -gt 0) {
+    if (-not $Quiet -and -not $Clean -and $total -gt 0) {
         Write-Host ""
         if ($dGuar -gt 0) {
             $script:Guaranteed | Select-Object -Last $dGuar | ForEach-Object {
@@ -1421,6 +1433,211 @@ function Add-Skipped { param([string]$Path, [string]$Reason)
     $script:SkippedFiles.Add([PSCustomObject]@{ Path = $Path; Reason = $Reason })
 }
 
+function Add-EncryptedSecretLead {
+    param([string]$Kind, [string]$Path, [int]$LineNumber, [string]$Reason)
+    $loc = if ($LineNumber -gt 0) { "${Path}:${LineNumber}" } else { $Path }
+    Add-Interesting -Category "ENCRYPTED_CREDENTIAL_LEAD/$Kind" -Path ("{0} ({1})" -f $loc, $Reason)
+}
+
+function Test-EncryptedSecretValueLine {
+    param([string]$Line)
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $false }
+    $sensitiveKey = '(?i)(password|passwd|passphrase|pwd|secret|credential|token|private[_-]?key|client[_-]?secret|api[_-]?key|auth|ansible_(user|username|password|become_password|ssh_private_key_file))'
+    $encryptedValue = '(?i)(!vault\b|\$ANSIBLE_VAULT;|ENC\[[A-Z0-9_]+,|vault:v\d+:|-----BEGIN PGP MESSAGE-----)'
+    return ($Line -match $sensitiveKey -and $Line -match '[:=]' -and $Line -match $encryptedValue)
+}
+
+function Invoke-EncryptedSecretLeadDetection {
+    param([string]$FullPath, [string]$Content)
+    if ([string]::IsNullOrEmpty($Content)) { return }
+    $reader = New-Object System.IO.StringReader($Content)
+    try {
+        $lineNo = 0
+        $pendingVaultKey = $null
+        $pendingVaultLine = 0
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $lineNo++
+            if ($lineNo -gt 5000) { break }
+            if ($line -match '(?i)^\s*([A-Za-z0-9_.-]*(password|passwd|passphrase|pwd|secret|credential|token|key|auth|user|username)[A-Za-z0-9_.-]*)\s*:\s*!vault\b') {
+                $pendingVaultKey = $Matches[1]
+                $pendingVaultLine = $lineNo
+                Add-EncryptedSecretLead -Kind 'ansible_vault' -Path $FullPath -LineNumber $lineNo -Reason ("encrypted YAML value for key '{0}'" -f $pendingVaultKey)
+                continue
+            }
+            if ($line -match '\$ANSIBLE_VAULT;') {
+                $reason = if ($pendingVaultKey) { "Ansible Vault payload for key '$pendingVaultKey'" } else { 'Ansible Vault payload' }
+                $ln = if ($pendingVaultLine -gt 0) { $pendingVaultLine } else { $lineNo }
+                Add-EncryptedSecretLead -Kind 'ansible_vault' -Path $FullPath -LineNumber $ln -Reason $reason
+                $pendingVaultKey = $null
+                $pendingVaultLine = 0
+                continue
+            }
+            if ($line -match '(?i)^\s*([A-Za-z0-9_.-]*(password|passwd|passphrase|pwd|secret|credential|token|key|auth)[A-Za-z0-9_.-]*)\s*[:=]\s*ENC\[[A-Z0-9_]+,') {
+                Add-EncryptedSecretLead -Kind 'sops_encrypted_value' -Path $FullPath -LineNumber $lineNo -Reason ("SOPS-style encrypted value for key '{0}'" -f $Matches[1])
+                continue
+            }
+            if ($line -match '(?i)^\s*encrypted(Data|StringData)?\s*:') {
+                Add-EncryptedSecretLead -Kind 'kubernetes_encrypted_data' -Path $FullPath -LineNumber $lineNo -Reason 'Kubernetes/SealedSecret encrypted data block'
+                continue
+            }
+            if ($line -match '(?i)^\s*kind\s*:\s*SealedSecret\b') {
+                Add-EncryptedSecretLead -Kind 'kubernetes_sealed_secret' -Path $FullPath -LineNumber $lineNo -Reason 'Kubernetes SealedSecret manifest'
+                continue
+            }
+            if (Test-EncryptedSecretValueLine -Line $line) {
+                Add-EncryptedSecretLead -Kind 'encrypted_secret_value' -Path $FullPath -LineNumber $lineNo -Reason 'sensitive key contains encrypted/vaulted value'
+            }
+        }
+    } finally {
+        $reader.Dispose()
+    }
+}
+
+function Get-ArtifactMagicKind {
+    param([string]$FullPath)
+    try {
+        $buf = New-Object byte[] 512
+        $fs = [System.IO.File]::Open($FullPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try { $n = $fs.Read($buf, 0, $buf.Length) } finally { $fs.Dispose() }
+        if ($n -lt 4) { return $null }
+        $ascii = [System.Text.Encoding]::ASCII.GetString($buf, 0, [Math]::Min($n, 512))
+        if ($buf[0] -eq 0x50 -and $buf[1] -eq 0x4B -and ($buf[2] -in 0x03,0x05,0x07) -and ($buf[3] -in 0x04,0x06,0x08)) { return 'zip_container' }
+        if ($buf[0] -eq 0x37 -and $buf[1] -eq 0x7A -and $buf[2] -eq 0xBC -and $buf[3] -eq 0xAF -and $buf[4] -eq 0x27 -and $buf[5] -eq 0x1C) { return '7z_container' }
+        if ($buf[0] -eq 0x52 -and $buf[1] -eq 0x61 -and $buf[2] -eq 0x72 -and $buf[3] -eq 0x21 -and $buf[4] -eq 0x1A -and $buf[5] -eq 0x07) { return 'rar_container' }
+        if ($buf[0] -eq 0x1F -and $buf[1] -eq 0x8B) { return 'gzip_container' }
+        if ($n -ge 262 -and $ascii.Substring(257, [Math]::Min(5, $ascii.Length - 257)) -eq 'ustar') { return 'tar_container' }
+        if ($ascii.StartsWith('SQLite format 3')) { return 'sqlite_container' }
+        if ($buf[0] -eq 0x03 -and $buf[1] -eq 0xD9 -and $buf[2] -eq 0xA2 -and $buf[3] -eq 0x9A) { return 'keepass_container' }
+        if ($ascii.StartsWith('-----BEGIN ')) { return 'pem_material' }
+    } catch {}
+    return $null
+}
+
+function Test-ReferenceCarrierName {
+    param([string]$Name, [string]$SourceLabel)
+    $n = $Name.ToLowerInvariant()
+    if ($SourceLabel -match '(?i)history|session|workspace|shortcut|recent|rdp|filezilla|winscp|putty|sublime|vscode|code') { return $true }
+    return (
+        $n -like '*.sublime_session' -or $n -like '*.sublime-workspace' -or $n -like '*.sublime-project' -or
+        $n -like '*.code-workspace' -or $n -eq 'session.xml' -or $n -eq 'shortcuts.xml' -or
+        $n -eq 'consolehost_history.txt' -or $n -like '*_history' -or $n -like '*.rdp' -or
+        $n -like '*.url' -or $n -like '*.desktop' -or $n -like '*.xbel' -or $n -eq '.viminfo'
+    )
+}
+
+function Get-ReferenceCandidates {
+    param([string]$Content)
+    $refs = [System.Collections.Generic.List[string]]::new()
+    if ([string]::IsNullOrEmpty($Content)) { return ,$refs }
+    $norm = $Content -replace '\\\\', '\'
+    $patterns = @(
+        'file:///[A-Za-z]:/[^\s"''<>]+',
+        'file:///[^\s"''<>]+',
+        '[A-Za-z]:\\[^\s"''<>|]+',
+        '\\\\[A-Za-z0-9._$-]+\\[^\s"''<>|]+',
+        '/(?:home|root|etc|var|opt|srv|tmp|mnt|media|run|backup|Users)/[^\s"''<>]+',
+        '(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+:(?:/|\\)[^\s"''<>]+'
+    )
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($pat in $patterns) {
+        foreach ($m in [regex]::Matches($norm, $pat)) {
+            $r = $m.Value.Trim().Trim('"', "'", ' ', ',', ';', ')', ']', '}', '`', [char]0)
+            $r = $r -replace '^file:///', ''
+            $r = $r -replace '/', '\'
+            if ($r.Length -lt 4) { continue }
+            if ($seen.Add($r)) { $refs.Add($r) }
+            if ($refs.Count -ge 100) { return ,$refs }
+        }
+    }
+    return ,$refs
+}
+
+function Resolve-ReferencePath {
+    param([string]$Reference, [string]$SourcePath)
+    if ([string]::IsNullOrWhiteSpace($Reference)) { return $null }
+    $r = $Reference.Trim()
+    try {
+        if ([System.IO.Path]::IsPathRooted($r)) { return [System.IO.Path]::GetFullPath($r) }
+        if ($SourcePath) {
+            $base = [System.IO.Path]::GetDirectoryName($SourcePath)
+            if ($base) { return [System.IO.Path]::GetFullPath((Join-Path $base $r)) }
+        }
+    } catch {}
+    return $r
+}
+
+function Invoke-ReferencedTargetInspection {
+    param([string]$Target, [string]$SourcePath)
+    $resolved = Resolve-ReferencePath -Reference $Target -SourcePath $SourcePath
+    if (-not $resolved) { return }
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) { return }
+    try { $fi = New-Object System.IO.FileInfo $resolved } catch { return }
+    $ext = $fi.Extension.ToLowerInvariant()
+    if ($script:Stage2ExtensionsSet.Contains($ext)) {
+        Add-Guaranteed -Extension $ext.TrimStart('.') -Path $fi.FullName
+        return
+    }
+    if ($script:EncryptedLeadExtensionsSet.Contains($ext)) {
+        Add-Interesting -Category 'ENCRYPTED_CREDENTIAL_LEAD' -Path $fi.FullName
+    }
+    $kind = Get-ArtifactMagicKind -FullPath $fi.FullName
+    if ($kind) {
+        $cat = if ($kind -match 'pem|keepass') { 'CREDENTIAL_CONTAINER' } else { 'CREDENTIAL_LEAD' }
+        Add-Interesting -Category "$cat/$kind" -Path $fi.FullName
+    }
+    if ($script:Stage3ExtensionsSet.Contains($ext) -or $script:Stage5ExtensionsSet.Contains($ext) -or
+        $script:ExtraScanNames.Contains($fi.Name.ToLowerInvariant()) -or [string]::IsNullOrEmpty($ext)) {
+        Add-Interesting -Category 'CREDENTIAL_LEAD/referenced_file' -Path $fi.FullName
+        Invoke-ScanFile -FullPath $fi.FullName -SourceLabel 'referenced' -KnownSize $fi.Length
+    }
+}
+
+function Add-ReferenceLead {
+    param(
+        [string]$SourcePath,
+        [string]$Target,
+        [string]$Application = 'artifact',
+        [string]$Reason = 'referenced by user/application artifact'
+    )
+    if ([string]::IsNullOrWhiteSpace($Target)) { return }
+    Add-Interesting -Category 'REFERENCE' -Path ("{0} -> {1}" -f $SourcePath, $Target)
+    Add-Interesting -Category 'CREDENTIAL_LEAD' -Path ("{0} -> {1} ({2}; {3})" -f $Application, $Target, $Reason, $SourcePath)
+    Invoke-ReferencedTargetInspection -Target $Target -SourcePath $SourcePath
+}
+
+function Invoke-ReferenceExtraction {
+    param([string]$FullPath, [string]$Content, [string]$Application = 'artifact')
+    foreach ($r in (Get-ReferenceCandidates -Content $Content)) {
+        Add-ReferenceLead -SourcePath $FullPath -Target $r -Application $Application
+    }
+}
+
+function Invoke-ShortcutReferenceExtraction {
+    param([string]$FullPath)
+    $targets = [System.Collections.Generic.List[string]]::new()
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $lnk = $shell.CreateShortcut($FullPath)
+        foreach ($v in @($lnk.TargetPath, $lnk.Arguments, $lnk.WorkingDirectory)) {
+            if (-not [string]::IsNullOrWhiteSpace($v)) { $targets.Add($v) }
+        }
+    } catch {}
+    if ($targets.Count -eq 0) {
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes($FullPath)
+            $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+            $unicode = [System.Text.Encoding]::Unicode.GetString($bytes)
+            foreach ($r in (Get-ReferenceCandidates -Content ($ascii + "`n" + $unicode))) { $targets.Add($r) }
+        } catch {}
+    }
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($t in $targets) {
+        if ($seen.Add($t)) {
+            Add-ReferenceLead -SourcePath $FullPath -Target $t -Application 'windows_shortcut' -Reason '.lnk target/strings'
+        }
+    }
+}
+
 # ============================================================================
 #  Content scanning core
 # ============================================================================
@@ -1461,7 +1678,11 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
         $bn -match '(?i)^tsconfig\..*\.json$' -or $bn -match '(?i)^tslint.*\.json$') {
         Add-Skipped -Path $FullPath -Reason 'non-credential filename'; return
     }
-    if ($bn -match '(?i)\.lnk$') { Add-Skipped -Path $FullPath -Reason 'shortcut'; return }
+    if ($bn -match '(?i)\.lnk$') {
+        Invoke-ShortcutReferenceExtraction -FullPath $FullPath
+        Add-Skipped -Path $FullPath -Reason 'shortcut parsed for references'
+        return
+    }
     # Pattern-based skips: minified / bundled / code-split / translation / maps
     if ($bn -match '\.(min|bundle)\.(js|css)$' -or $bn -match '\.chunk\.js$') {
         Add-Skipped -Path $FullPath -Reason 'minified asset'; return
@@ -1492,6 +1713,12 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
     $content = Read-TextFileSmart -FullPath $FullPath
     if ($null -eq $content) { Add-Skipped -Path $FullPath -Reason 'binary'; return }
     if ([string]::IsNullOrEmpty($content)) { return }
+
+    Invoke-EncryptedSecretLeadDetection -FullPath $FullPath -Content $content
+
+    if (Test-ReferenceCarrierName -Name $bn -SourceLabel $SourceLabel) {
+        Invoke-ReferenceExtraction -FullPath $FullPath -Content $content -Application $SourceLabel
+    }
 
     # ---- Private-key markers (format-anchored) ------------------------------
     # ~99% of files contain no key header, so gate the 8 whole-file regex passes
@@ -1554,6 +1781,8 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             $m = $p.Regex.Match($line)
             if (-not $m.Success) { continue }
 
+            if (Test-EncryptedSecretValueLine -Line $line) { break }
+
             # Commented example skip: stock configs ship docs like
             # `# snmpwalk -c public`. Skip comment lines ONLY for
             # command/directive patterns; generic key=value assignments are
@@ -1601,7 +1830,7 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             # "DefaultPassword"="value" yields the real value (the boundary-anchored
             # keyword extractor above skips "password" inside the compound key
             # "DefaultPassword" and would otherwise latch onto a keyword in the value).
-            if ($p.Label -eq 'drupal_password' -or $p.Label -eq 'wp_db_password' -or
+            if ($p.Label -eq 'drupal_password' -or $p.Label -eq 'php_array_secret' -or $p.Label -eq 'wp_db_password' -or
                 $p.Label -eq 'joomla_password' -or $p.Label -eq 'define_secret' -or
                 $p.Label -eq 'php_db_connect' -or $p.Label -eq 'autologon_password') {
                 $mq = [regex]::Match($line, '["'']([^"'']+)["''][^"'']*$')
@@ -2428,6 +2657,72 @@ function Test-DotNetUserSecrets {
     } catch {}
 }
 
+function Test-AppSessionArtifacts {
+    Write-Info "Stage 1.30 - editor/session artifacts (Sublime / VS Code / Notepad++ / Windows Terminal)"
+    $userRoots = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in @($env:USERPROFILE)) {
+        if ($p -and (Test-Path -LiteralPath $p)) { $userRoots.Add($p) }
+    }
+    try {
+        $usersDir = Join-Path $env:SystemDrive 'Users'
+        if (Test-Path -LiteralPath $usersDir) {
+            Get-ChildItem -LiteralPath $usersDir -Directory -Force -ErrorAction SilentlyContinue |
+                Select-Object -First 100 |
+                ForEach-Object { $userRoots.Add($_.FullName) }
+        }
+    } catch {}
+
+    $seenUsers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($u in $userRoots) {
+        if (-not $seenUsers.Add($u)) { continue }
+        $candidateFiles = [System.Collections.Generic.List[string]]::new()
+        foreach ($rel in @(
+            'AppData\Roaming\Sublime Text\Local\Session.sublime_session',
+            'AppData\Roaming\Sublime Text\Local\Auto Save Session.sublime_session',
+            'AppData\Roaming\Sublime Text 3\Local\Session.sublime_session',
+            'AppData\Roaming\Sublime Text 3\Local\Auto Save Session.sublime_session',
+            'AppData\Roaming\Notepad++\session.xml',
+            'AppData\Roaming\Notepad++\shortcuts.xml',
+            'AppData\Roaming\Code\User\globalStorage\storage.json',
+            'AppData\Roaming\Code\User\settings.json',
+            'AppData\Roaming\Code - Insiders\User\globalStorage\storage.json',
+            'AppData\Roaming\Code - Insiders\User\settings.json'
+        )) {
+            $p = Join-Path $u $rel
+            if (Test-Path -LiteralPath $p -PathType Leaf) { $candidateFiles.Add($p) }
+        }
+        foreach ($dir in @(
+            (Join-Path $u 'AppData\Roaming\Sublime Text\Packages\User'),
+            (Join-Path $u 'AppData\Roaming\Sublime Text 3\Packages\User'),
+            (Join-Path $u 'Desktop'),
+            (Join-Path $u 'Documents')
+        )) {
+            if (-not (Test-Path -LiteralPath $dir)) { continue }
+            try {
+                Get-ChildItem -LiteralPath $dir -Force -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -like '*.sublime-project' -or $_.Name -like '*.sublime-workspace' -or $_.Name -like '*.code-workspace' } |
+                    Select-Object -First 50 |
+                    ForEach-Object { $candidateFiles.Add($_.FullName) }
+            } catch {}
+        }
+        $wt = Join-Path $u 'AppData\Local\Packages'
+        if (Test-Path -LiteralPath $wt) {
+            try {
+                Get-ChildItem -LiteralPath $wt -Directory -Filter 'Microsoft.WindowsTerminal*' -ErrorAction SilentlyContinue |
+                    Select-Object -First 5 |
+                    ForEach-Object {
+                        $settings = Join-Path $_.FullName 'LocalState\settings.json'
+                        if (Test-Path -LiteralPath $settings -PathType Leaf) { $candidateFiles.Add($settings) }
+                    }
+            } catch {}
+        }
+        foreach ($f in ($candidateFiles | Select-Object -Unique | Select-Object -First 200)) {
+            Add-Interesting -Category 'USER_ARTIFACT/app_session' -Path $f
+            Invoke-ScanFile -FullPath $f -SourceLabel 'app_session'
+        }
+    }
+}
+
 function Invoke-SystemChecks {
     $script:InStage1 = $true
     Invoke-Stage1Check { Test-RegistryAutoLogon }
@@ -2459,6 +2754,7 @@ function Invoke-SystemChecks {
     Invoke-Stage1Check { Test-DBClients }
     Invoke-Stage1Check { Test-AppServers }
     Invoke-Stage1Check { Test-DotNetUserSecrets }
+    Invoke-Stage1Check { Test-AppSessionArtifacts }
     $script:InStage1 = $false
 }
 
@@ -2543,6 +2839,17 @@ function Find-HighValueFiles { param($Files)
         # Stage3ExactNamesSet are OrdinalIgnoreCase, so the lowercased Name works.
         if ($script:SkipDbFilenames.Contains($f.Name)) { continue }
 
+        if ($f.Ext -eq '.lnk') {
+            Add-Interesting -Category 'USER_ARTIFACT/shortcut' -Path $f.Path
+            Invoke-ShortcutReferenceExtraction -FullPath $f.Path
+            continue
+        }
+
+        if ($script:EncryptedLeadExtensionsSet.Contains($f.Ext)) {
+            Add-Interesting -Category 'ENCRYPTED_CREDENTIAL_LEAD' -Path $f.Path
+            continue
+        }
+
         $matched = $false
         # Pass 1: extension
         if ($script:Stage3ExtensionsSet.Contains($f.Ext)) { $matched = $true }
@@ -2555,6 +2862,13 @@ function Find-HighValueFiles { param($Files)
             }
         }
         if ($matched) { Add-Interesting -Category 'high_value_file' -Path $f.Path }
+        if (-not $matched -and $f.Size -gt 0 -and $f.Size -le 52428800) {
+            $kind = Get-ArtifactMagicKind -FullPath $f.Path
+            if ($kind) {
+                $cat = if ($kind -match 'pem|keepass') { 'CREDENTIAL_CONTAINER' } else { 'CREDENTIAL_LEAD' }
+                Add-Interesting -Category "$cat/$kind" -Path $f.Path
+            }
+        }
     }
 }
 
@@ -2676,6 +2990,98 @@ function Write-FindingsSection {
         Write-Host ("  $Color[$Tag]$($script:CNC) $($script:CD)$($f.Label)$($script:CNC)  $($script:CY)$($f.Path):$($f.LineNumber)$($script:CNC)")
         Write-Host ("       $($script:CD)$($f.Preview)$($script:CNC)")
         Write-LogLine ("[$Tag] $($f.Label) $($f.Path):$($f.LineNumber)  $($f.Preview)")
+    }
+}
+
+function Write-CleanLine {
+    param([string]$Line)
+    Write-Host $Line
+    Write-LogLine $Line
+}
+
+function Write-CleanFindings {
+    param(
+        [string]$Title,
+        [object[]]$Items,
+        [int]$Limit = 25,
+        [scriptblock]$Renderer
+    )
+    if (-not $Items -or $Items.Count -eq 0) { return }
+    Write-CleanLine ""
+    Write-CleanLine "$($script:CBold)$($script:CW)$Title$($script:CNC)"
+    $shown = 0
+    foreach ($item in ($Items | Select-Object -First $Limit)) {
+        $shown++
+        & $Renderer $item
+    }
+    $remaining = $Items.Count - $shown
+    if ($remaining -gt 0) {
+        Write-CleanLine ("  $($script:CD)... {0} more hidden in clean view$($script:CNC)" -f $remaining)
+    }
+}
+
+function Write-CleanSummary {
+    $top = 25
+    Write-Section "Clean findings summary"
+    Write-LogLine ""
+    Write-LogLine "=== Clean findings summary ==="
+
+    $high = @($script:HighFindings | Sort-Object Path, LineNumber, Label)
+    Write-CleanFindings -Title "Directly usable credentials" -Items $high -Limit $top -Renderer {
+        param($f)
+        Write-CleanLine ("  $($script:CR)[HIGH]$($script:CNC) {0}  $($script:CD){1}: line {2}$($script:CNC)" -f $f.Label, $f.Path, $f.LineNumber)
+        if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
+    }
+
+    $containers = @($script:Guaranteed | Sort-Object Extension, Path)
+    Write-CleanFindings -Title "Credential containers" -Items $containers -Limit $top -Renderer {
+        param($g)
+        Write-CleanLine ("  $($script:CR)[CRITICAL]$($script:CNC) {0,-8} {1}" -f $g.Extension, $g.Path)
+    }
+
+    $keys = @($script:KeyFindings | Sort-Object Path, LineNumber, Label)
+    Write-CleanFindings -Title "Private keys and auth material" -Items $keys -Limit $top -Renderer {
+        param($f)
+        Write-CleanLine ("  $($script:CM)[KEY]$($script:CNC) {0}  $($script:CD){1}: line {2}$($script:CNC)" -f $f.Label, $f.Path, $f.LineNumber)
+        if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
+    }
+
+    $encrypted = @($script:Interesting | Where-Object { $_.Category -like 'ENCRYPTED_CREDENTIAL_LEAD*' } | Sort-Object Category, Path)
+    Write-CleanFindings -Title "Encrypted credential leads" -Items $encrypted -Limit $top -Renderer {
+        param($i)
+        Write-CleanLine ("  $($script:CC)[LEAD]$($script:CNC) {0}  {1}" -f $i.Category, $i.Path)
+    }
+
+    $leadCats = @('CREDENTIAL_LEAD*','REFERENCE','USER_ARTIFACT*')
+    $leads = @($script:Interesting | Where-Object {
+        $cat = $_.Category
+        ($leadCats | Where-Object { $cat -like $_ }).Count -gt 0 -and $cat -notlike 'ENCRYPTED_CREDENTIAL_LEAD*'
+    } | Sort-Object Category, Path)
+    Write-CleanFindings -Title "References and user-artifact leads" -Items $leads -Limit $top -Renderer {
+        param($i)
+        Write-CleanLine ("  $($script:CY)[LEAD]$($script:CNC) {0}  {1}" -f $i.Category, $i.Path)
+    }
+
+    $other = @($script:Interesting | Where-Object {
+        $_.Category -notlike 'ENCRYPTED_CREDENTIAL_LEAD*' -and
+        $_.Category -notlike 'CREDENTIAL_LEAD*' -and
+        $_.Category -ne 'REFERENCE' -and
+        $_.Category -notlike 'USER_ARTIFACT*'
+    } | Sort-Object Category, Path)
+    Write-CleanFindings -Title "Other interesting files" -Items $other -Limit 10 -Renderer {
+        param($i)
+        Write-CleanLine ("  $($script:CC)[INTEREST]$($script:CNC) {0}  {1}" -f $i.Category, $i.Path)
+    }
+
+    Write-CleanLine ""
+    Write-CleanLine "$($script:CBold)$($script:CW)Counts$($script:CNC)"
+    Write-CleanLine ("  HIGH: {0}  KEY: {1}  CONTAINERS: {2}  ENCRYPTED_LEADS: {3}  LEADS: {4}  OTHER_INTEREST: {5}  NAME: {6}  SKIPPED: {7}" -f `
+        $script:HighFindings.Count, $script:KeyFindings.Count, $script:Guaranteed.Count,
+        $encrypted.Count, $leads.Count, $other.Count, $script:SuspiciousNamesFound.Count, $script:SkippedFiles.Count)
+
+    if ($script:LogPath) {
+        Write-CleanLine ""
+        Write-CleanLine "$($script:CB)[*]$($script:CNC) Clean log written to $($script:CW)$($script:LogPath)$($script:CNC)"
     }
 }
 
@@ -2875,7 +3281,7 @@ function Invoke-Main {
         }
     }
     } finally {
-        Write-FullSummary
+        if ($Clean) { Write-CleanSummary } else { Write-FullSummary }
     }
 
     if ($script:Guaranteed.Count -gt 0 -or

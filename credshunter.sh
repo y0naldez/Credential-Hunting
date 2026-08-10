@@ -50,6 +50,7 @@ MAX_FILE_SIZE_MB=5
 SKIP_LARGE=1
 ALL_MODE=0
 QUIET=0
+CLEAN=0
 SKIP_SYSTEM=0
 STAGE1_SKIP=0
 STAGE2_SKIP=0
@@ -270,6 +271,7 @@ Options:
       --no-stage4       Skip stage 4 (filename substring search).
       --no-stage5       Skip stage 5 (recursive content scan).
   -q, --quiet           Reduce status noise. Findings still printed.
+      --clean           Show compact final console summary; suppress stage details.
       --no-color        Strip ANSI escape codes.
   -h, --help            Show this help.
   -V, --version         Show version.
@@ -304,6 +306,9 @@ STAGE2_EXTENSIONS=(
     bitwarden_export ppk pfx p12 pvk jks keystore truststore bek fve keytab
     dpapimk
 )
+ENCRYPTED_LEAD_EXTENSIONS=(
+    axx enc encrypted aes gpg pgp
+)
 
 # -- Stage 3 -- high-value file types (match = [INTEREST]) -------------------
 # Files matching these are surfaced but not auto-classified as credentials.
@@ -327,7 +332,7 @@ STAGE3_EXTENSIONS=(
     # Packet captures (may contain plaintext auth)
     pcap pcapng
     # Compressed archives (admin backups often contain creds)
-    tar tgz gz zip 7z
+    tar tgz gz zip 7z rar
 )
 
 # Exact filename matches for Stage 3 (names that cannot be expressed as
@@ -379,7 +384,7 @@ STAGE5_EXTENSIONS=(
     # Windows-specific text formats
     reg pol rdp rdg rdcman inf unattend answerfile
     # Remote access tools
-    ovpn openvpn vnc rdc tcc ica session script kix
+    ovpn openvpn vnc rdc tcc ica session sublime_session script kix
     # Plain text / notes
     txt text md markdown rtf nfo log logs readme
     # Backups / temp / cached configs
@@ -400,7 +405,7 @@ STAGE5_EXTENSIONS=(
     # ── .NET / Visual Studio project & publish files (conn strings, deploy) ─
     csproj vbproj fsproj vcxproj sln resx resw pubxml publishsettings manifest
     # ── Windows scripting / app / shortcut formats ───────────────────────
-    hta au3 url psc1 pssc desktop
+    hta au3 url psc1 pssc desktop code-workspace sublime-project sublime-workspace
     # ── VPN / network configuration ──────────────────────────────────────
     nmconnection network netdev link wg pcf mobileconfig
     # ── Database scripts / ORM schemas ───────────────────────────────────
@@ -439,6 +444,7 @@ parse_args() {
             --no-stage4)      STAGE4_SKIP=1; shift ;;
             --no-stage5)      STAGE5_SKIP=1; shift ;;
             -q|--quiet)       QUIET=1; shift ;;
+            --clean)          CLEAN=1; shift ;;
             --no-color)       NO_COLOR_FLAG=1; shift ;;
             -h|--help)        usage; exit 0 ;;
             -V|--version)     echo "credshunter $VERSION"; exit 0 ;;
@@ -497,10 +503,6 @@ parse_args() {
 CRED_PATTERNS=(
     # ── Direct password assignments ──────────────────────────────────────
     'password_assign|(^|[^A-Za-z_])(password|passwd|passphrase|pwd)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
-
-    # PHP associative-array assignments, e.g. $sql['password']='secret' or
-    # $sql_root[0]['password'] = 'secret'.
-    "php_array_password|\\[['\"](password|passwd|passphrase|pwd|secret)['\"]\\][[:space:]]*(=|=>)[[:space:]]*['\"]([^'\"]{3,})['\"]"
 
     # ── DB / service-prefixed passwords ──────────────────────────────────
     'db_password|(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|sftp|cifs)[_-]?(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
@@ -597,6 +599,7 @@ CRED_PATTERNS=(
     'wp_db_password|define\([[:space:]]*['"'"'"]DB_PASSWORD['"'"'"][[:space:]]*,[[:space:]]*['"'"'"][^'"'"'"]{2,}'
     'joomla_password|public[[:space:]]+\$(password|smtppass|dbpass|secret)[[:space:]]*=[[:space:]]*['"'"'"][^'"'"'"]{2,}'
     'drupal_password|['"'"'"]password['"'"'"][[:space:]]*=>[[:space:]]*['"'"'"][^'"'"'"]{4,}'
+    'php_array_secret|['"'"'"]([A-Za-z0-9_.-]+[_\.-])?(password|passwd|pwd|pass|secret|token|auth|api[_-]?key|client[_-]?secret|db[_-]?pass(word)?|database[_-]?pass(word)?|redis[_-]?pass|smtp[_-]?pass)['"'"'"][[:space:]]*=>[[:space:]]*['"'"'"][^'"'"'"]{3,}'
     # Generic PHP define() for any *PASSWORD/*PASS/*PWD/*SECRET constant
     # (DB_PASS, SMTP_PASSWORD, SECRET_KEY, ...). CTF staple beyond DB_PASSWORD.
     'define_secret|define[[:space:]]*\([[:space:]]*['"'"'"][A-Za-z0-9_]*(PASSWORD|PASSWD|PWD|PASS|SECRET)['"'"'"][[:space:]]*,[[:space:]]*['"'"'"][^'"'"'"]{3,}'
@@ -984,6 +987,157 @@ record_guaranteed() {
     [ "$IN_STAGE1" -eq 1 ] && stage1_emit CRITICAL "$1" "$REPLY"
 }
 
+encrypted_secret_value_line() {
+    local line="$1"
+    [[ "$line" =~ (password|passwd|passphrase|pwd|secret|credential|token|private[-_]?key|client[-_]?secret|api[-_]?key|auth|ansible_(user|username|password|become_password|ssh_private_key_file)) ]] || return 1
+    [[ "$line" =~ [:=-] ]] || return 1
+    [[ "$line" =~ ![[:space:]]*vault|\$ANSIBLE_VAULT\;|ENC\[[A-Z0-9_]+,|vault:v[0-9]+:|-----BEGIN[[:space:]]+PGP[[:space:]]+MESSAGE----- ]]
+}
+
+record_encrypted_secret_lead() {
+    local kind="$1" file="$2" line="$3" reason="$4" loc="$2"
+    [ "${line:-0}" -gt 0 ] 2>/dev/null && loc="${file}:${line}"
+    record_interest "ENCRYPTED_CREDENTIAL_LEAD/$kind" "$loc ($reason)"
+}
+
+detect_encrypted_secret_leads() {
+    local file="$1" line lineno=0 pending_key="" pending_line=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        [ "$lineno" -gt 5000 ] && break
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_.-]*(password|passwd|passphrase|pwd|secret|credential|token|key|auth|user|username)[A-Za-z0-9_.-]*)[[:space:]]*:[[:space:]]*![[:space:]]*vault ]]; then
+            pending_key="${BASH_REMATCH[1]}"
+            pending_line="$lineno"
+            record_encrypted_secret_lead "ansible_vault" "$file" "$lineno" "encrypted YAML value for key '$pending_key'"
+            continue
+        fi
+        if [[ "$line" == *'$ANSIBLE_VAULT;'* ]]; then
+            if [ -n "$pending_key" ]; then
+                record_encrypted_secret_lead "ansible_vault" "$file" "$pending_line" "Ansible Vault payload for key '$pending_key'"
+            else
+                record_encrypted_secret_lead "ansible_vault" "$file" "$lineno" "Ansible Vault payload"
+            fi
+            pending_key=""
+            pending_line=0
+            continue
+        fi
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_.-]*(password|passwd|passphrase|pwd|secret|credential|token|key|auth)[A-Za-z0-9_.-]*)[[:space:]]*[:=][[:space:]]*ENC\[[A-Z0-9_]+, ]]; then
+            record_encrypted_secret_lead "sops_encrypted_value" "$file" "$lineno" "SOPS-style encrypted value for key '${BASH_REMATCH[1]}'"
+            continue
+        fi
+        if [[ "$line" =~ ^[[:space:]]*encrypted(Data|StringData)?[[:space:]]*: ]]; then
+            record_encrypted_secret_lead "kubernetes_encrypted_data" "$file" "$lineno" "Kubernetes/SealedSecret encrypted data block"
+            continue
+        fi
+        if [[ "$line" =~ ^[[:space:]]*kind[[:space:]]*:[[:space:]]*SealedSecret[[:space:]]*$ ]]; then
+            record_encrypted_secret_lead "kubernetes_sealed_secret" "$file" "$lineno" "Kubernetes SealedSecret manifest"
+            continue
+        fi
+        if encrypted_secret_value_line "$line"; then
+            record_encrypted_secret_lead "encrypted_secret_value" "$file" "$lineno" "sensitive key contains encrypted/vaulted value"
+        fi
+    done <"$file"
+}
+
+has_ext_in() {
+    local ext="${1#.}" item
+    ext="${ext,,}"
+    shift
+    for item in "$@"; do
+        [ "$ext" = "${item#.}" ] && return 0
+    done
+    return 1
+}
+
+detect_artifact_magic() {
+    local file="$1" hex
+    [ -r "$file" ] || return 1
+    hex=$(od -An -tx1 -N 512 -- "$file" 2>/dev/null | tr -d ' \n') || return 1
+    [ -n "$hex" ] || return 1
+    case "$hex" in
+        504b0304*|504b0506*|504b0708*) printf 'zip_container'; return 0 ;;
+        377abcaf271c*)                 printf '7z_container'; return 0 ;;
+        526172211a07*)                 printf 'rar_container'; return 0 ;;
+        1f8b*)                         printf 'gzip_container'; return 0 ;;
+        53514c69746520666f726d61742033*) printf 'sqlite_container'; return 0 ;;
+        03d9a29a*)                     printf 'keepass_container'; return 0 ;;
+        2d2d2d2d2d424547494e20*)       printf 'pem_material'; return 0 ;;
+    esac
+    local tar_magic
+    tar_magic=$(dd if="$file" bs=1 skip=257 count=5 2>/dev/null)
+    [ "$tar_magic" = "ustar" ] && { printf 'tar_container'; return 0; }
+    return 1
+}
+
+reference_carrier_name() {
+    local file="$1" source_label="$2" bn="${1##*/}" lower
+    lower="${bn,,}"
+    case "${source_label,,}" in
+        *history*|*session*|*workspace*|*recent*|*sublime*|*vscode*|*code*) return 0 ;;
+    esac
+    case "$lower" in
+        *.sublime_session|*.sublime-workspace|*.sublime-project|*.code-workspace) return 0 ;;
+        consolehost_history.txt|*_history|.*_history|.viminfo|recently-used.xbel|*.desktop|*.url|*.rdp) return 0 ;;
+        session.xml|shortcuts.xml) return 0 ;;
+    esac
+    return 1
+}
+
+extract_references_from_file() {
+    local file="$1"
+    LC_ALL=C tr '\r' '\n' <"$file" 2>/dev/null |
+        sed 's/\\\\/\\/g' |
+        grep -aEo 'file://[^[:space:]"'"'"'<>]+|[A-Za-z]:\\[^[:space:]"'"'"'<>|]+|\\\\[^[:space:]"'"'"'<>|]+|/(home|root|etc|var|opt|srv|tmp|mnt|media|run|backup|Users)/[^[:space:]"'"'"'<>]+|([A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+:/[^[:space:]"'"'"'<>]+' 2>/dev/null |
+        sed 's/[",;)}\]]*$//' |
+        awk 'length($0) >= 4 && !seen[tolower($0)]++ { print; if (++n >= 100) exit }'
+}
+
+inspect_referenced_target() {
+    local target="$1" source="$2" resolved="$1" ext kind
+    resolved="${resolved#file://}"
+    resolved="${resolved#file:}"
+    case "$resolved" in
+        ~/*) resolved="${HOME:-/root}/${resolved#~/}" ;;
+        /*) ;;
+        *) [ -n "$source" ] && resolved="$(dirname -- "$source")/$resolved" ;;
+    esac
+    [ -f "$resolved" ] || return 0
+    ext="${resolved##*.}"
+    [ "$ext" = "$resolved" ] && ext=""
+    if [ -n "$ext" ] && has_ext_in "$ext" "${STAGE2_EXTENSIONS[@]}"; then
+        record_guaranteed "${ext,,}" "$resolved"
+        return 0
+    fi
+    if [ -n "$ext" ] && has_ext_in "$ext" "${ENCRYPTED_LEAD_EXTENSIONS[@]}"; then
+        record_interest "ENCRYPTED_CREDENTIAL_LEAD" "$resolved"
+    fi
+    if kind=$(detect_artifact_magic "$resolved"); then
+        case "$kind" in
+            pem_material|keepass_container) record_interest "CREDENTIAL_CONTAINER/$kind" "$resolved" ;;
+            *)                              record_interest "CREDENTIAL_LEAD/$kind" "$resolved" ;;
+        esac
+    fi
+    if [ -z "$ext" ] || has_ext_in "$ext" "${STAGE3_EXTENSIONS[@]}" || has_ext_in "$ext" "${STAGE5_EXTENSIONS[@]}"; then
+        record_interest "CREDENTIAL_LEAD/referenced_file" "$resolved"
+        scan_file "$resolved" "referenced"
+    fi
+}
+
+record_reference_lead() {
+    local source="$1" target="$2" app="${3:-artifact}" reason="${4:-referenced by user/application artifact}"
+    [ -n "$target" ] || return 0
+    record_interest "REFERENCE" "$source -> $target"
+    record_interest "CREDENTIAL_LEAD" "$app -> $target ($reason; $source)"
+    inspect_referenced_target "$target" "$source"
+}
+
+extract_reference_leads() {
+    local file="$1" app="${2:-artifact}" ref
+    while IFS= read -r ref; do
+        [ -n "$ref" ] && record_reference_lead "$file" "$ref" "$app"
+    done < <(extract_references_from_file "$file")
+}
+
 # ----------------------------------------------------------------------------
 #  Progress bar
 # ----------------------------------------------------------------------------
@@ -1072,7 +1226,7 @@ stage_end() {
         "$D$C" "$(hbar "$GH" 2)" "$BOLD" "$header" "$NC" "$D$C" "$(hbar "$GH" "$fill")" "$NC"
     printf '     %b%s found in %ss%b\n' "$D" "$total" "$elapsed" "$NC"
 
-    if [ "$QUIET" -eq 0 ] && [ "$total" -gt 0 ]; then
+    if [ "$QUIET" -eq 0 ] && [ "$CLEAN" -eq 0 ] && [ "$total" -gt 0 ]; then
         printf '\n'
         stage_print_delta CRITICAL  "$GUARANTEED_FILE" "${STAGE_BEFORE_GUARANTEED[$n]:-0}" "$d_guar"
         stage_print_delta HIGH      "$HIGH_FILE"       "${STAGE_BEFORE_HIGH[$n]:-0}"       "$d_hi"
@@ -1163,6 +1317,7 @@ classify_line() {
         label="${entry%%|*}"
         regex="${entry#*|}"
         if [[ "$content" =~ $regex ]]; then
+            encrypted_secret_value_line "$content" && return 1
             # ── Commented example skip ───────────────────────────────────
             # Stock configs ship docs like `# snmpwalk -c public` or
             # `# rocommunity public` — examples, not live creds. Skip comment
@@ -1197,13 +1352,7 @@ classify_line() {
             # last quoted literal on the line as the value before FP-filtering
             # (e.g.  'password' => 'changeme'  ->  changeme).
             case "$label" in
-                php_array_password)
-                    local php_array_regex="\\[['\"](password|passwd|passphrase|pwd|secret)['\"]\\][[:space:]]*(=|=>)[[:space:]]*['\"]([^'\"]{3,})['\"]"
-                    if [[ "$content" =~ $php_array_regex ]]; then
-                        value="${BASH_REMATCH[3]}"
-                    fi
-                    ;;
-                drupal_password|wp_db_password)
+                drupal_password|php_array_secret|wp_db_password)
                     if [[ "$content" =~ .*[\'\"]([^\'\"]+)[\'\"][^\'\"]*$ ]]; then
                         value="${BASH_REMATCH[1]}"
                     fi
@@ -1281,6 +1430,10 @@ scan_file() {
         fi
     fi
     is_binary "$file" && { record_skip "$file" "binary"; return; }
+    detect_encrypted_secret_leads "$file"
+    if reference_carrier_name "$file" "$source_label"; then
+        extract_reference_leads "$file" "$source_label"
+    fi
 
     # ── Phase 1: private-key markers ─────────────────────────────────────
     local key_entry plabel
@@ -1676,6 +1829,38 @@ check_docker_kube() {
         -o -path '*/.kube/*.yaml' \) -print0 2>/dev/null)
 }
 
+check_app_session_artifacts() {
+    info "Stage 1.13 -- editor/session artifacts (Sublime / VS Code / desktop recent files)"
+    local f kind
+    while IFS= read -r -d '' f; do
+        record_interest "USER_ARTIFACT/app_session" "$f"
+        scan_file "$f" "app_session"
+    done < <(find /root /home -maxdepth 8 -type f \( \
+        -name '*.sublime_session' \
+        -o -name '*.sublime-project' \
+        -o -name '*.sublime-workspace' \
+        -o -name '*.code-workspace' \
+        -o -name 'recently-used.xbel' \
+        -o -name '.viminfo' \
+        -o -name 'session.xml' \
+        -o -name 'shortcuts.xml' \
+        -o -path '*/.config/Code/User/globalStorage/storage.json' \
+        -o -path '*/.config/Code/User/workspaceStorage/*.json' \
+        -o -path '*/.config/sublime-text*/Local/*Session*.sublime_session' \
+        \) -print0 2>/dev/null)
+
+    while IFS= read -r -d '' f; do
+        record_interest "USER_ARTIFACT/app_state_container" "$f"
+        if kind=$(detect_artifact_magic "$f"); then
+            record_interest "CREDENTIAL_LEAD/$kind" "$f"
+        fi
+    done < <(find /root /home -maxdepth 8 -type f \( \
+        -path '*/.config/Code/User/globalStorage/state.vscdb' \
+        -o -path '*/.config/Code/User/workspaceStorage/*/state.vscdb' \
+        -o -path '*/.local/share/nvim/shada/*' \
+        \) -print0 2>/dev/null)
+}
+
 run_system_checks() {
     IN_STAGE1=1
     run_stage1_check check_shell_histories
@@ -1690,6 +1875,7 @@ run_system_checks() {
     run_stage1_check check_wifi
     run_stage1_check check_misc_services
     run_stage1_check check_docker_kube
+    run_stage1_check check_app_session_artifacts
     IN_STAGE1=0
 }
 
@@ -1822,6 +2008,7 @@ find_high_value_files() {
     # One combined match expression: extensions OR exact filenames OR globs.
     local match=() e n gp
     for e  in "${STAGE3_EXTENSIONS[@]}";    do match+=( -o -iname "*.${e}" ); done
+    for e  in "${ENCRYPTED_LEAD_EXTENSIONS[@]}"; do match+=( -o -iname "*.${e}" ); done
     for n  in "${STAGE3_EXACT_NAMES[@]}";   do match+=( -o -iname "$n" );     done
     for gp in "${STAGE3_GLOB_PATTERNS[@]}"; do match+=( -o -iname "$gp" );    done
     local name_expr=( '(' "${match[@]:1}" ')' )
@@ -1839,8 +2026,33 @@ find_high_value_files() {
                 if [ "${bn,,}" = "${k,,}" ]; then skip=1; break; fi
             done
             [ "$skip" -eq 1 ] && continue
+            local ext="${bn##*.}"
+            if [ "$ext" != "$bn" ] && has_ext_in "$ext" "${ENCRYPTED_LEAD_EXTENSIONS[@]}"; then
+                record_interest "ENCRYPTED_CREDENTIAL_LEAD" "$f"
+                continue
+            fi
             record_interest "high_value_file" "$f"
         done < <(find "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${name_expr[@]}" -print0 2>/dev/null)
+
+        while IFS= read -r -d '' f; do
+            [ -z "$f" ] && continue
+            local bn ext kind
+            bn="${f##*/}"
+            ext="${bn##*.}"
+            if [ "$ext" != "$bn" ] && {
+                has_ext_in "$ext" "${STAGE2_EXTENSIONS[@]}" ||
+                has_ext_in "$ext" "${STAGE3_EXTENSIONS[@]}" ||
+                has_ext_in "$ext" "${ENCRYPTED_LEAD_EXTENSIONS[@]}"
+            }; then
+                continue
+            fi
+            if kind=$(detect_artifact_magic "$f"); then
+                case "$kind" in
+                    pem_material|keepass_container) record_interest "CREDENTIAL_CONTAINER/$kind" "$f" ;;
+                    *)                              record_interest "CREDENTIAL_LEAD/$kind" "$f" ;;
+                esac
+            fi
+        done < <(find "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f -size -52428800c -print0 2>/dev/null)
     done
 }
 
@@ -2090,6 +2302,103 @@ print_summary() {
     fi
 }
 
+clean_line() {
+    printf '%b\n' "$*"
+    log_line "$*"
+}
+
+clean_section() {
+    clean_line ""
+    clean_line "${BOLD}${W}$1${NC}"
+}
+
+print_clean_tsv_findings() {
+    local title="$1" file="$2" tag="$3" color="$4" limit="${5:-25}"
+    [ -s "$file" ] || return 0
+    clean_section "$title"
+    sort -u "$file" | awk -F'\t' -v tag="$tag" -v limit="$limit" -v color="$color" -v nc="$NC" -v dim="$D" '
+        NR <= limit {
+            printf "  %s[%s]%s %s  %s%s: line %s%s\n", color, tag, nc, $1, dim, $2, $3, nc
+            if ($4 != "") printf "         %s%s%s\n", dim, $4, nc
+        }
+        END {
+            if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc
+        }'
+}
+
+print_clean_interest_filter() {
+    local title="$1" pattern="$2" tag="$3" color="$4" limit="${5:-25}"
+    [ -s "$INTEREST_FILE" ] || return 0
+    local tmp="$TMPDIR/clean-interest.$$"
+    awk -F'\t' -v pat="$pattern" '$1 ~ pat { print }' "$INTEREST_FILE" | sort -u >"$tmp"
+    [ -s "$tmp" ] || { rm -f "$tmp"; return 0; }
+    clean_section "$title"
+    awk -F'\t' -v tag="$tag" -v limit="$limit" -v color="$color" -v nc="$NC" -v dim="$D" '
+        NR <= limit { printf "  %s[%s]%s %s  %s\n", color, tag, nc, $1, $2 }
+        END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }' "$tmp"
+    rm -f "$tmp"
+}
+
+print_clean_other_interest() {
+    [ -s "$INTEREST_FILE" ] || return 0
+    local tmp="$TMPDIR/clean-other-interest.$$"
+    awk -F'\t' '$1 !~ /^ENCRYPTED_CREDENTIAL_LEAD/ && $1 !~ /^CREDENTIAL_LEAD/ && $1 != "REFERENCE" && $1 !~ /^USER_ARTIFACT/ { print }' "$INTEREST_FILE" |
+        sort -u >"$tmp"
+    [ -s "$tmp" ] || { rm -f "$tmp"; return 0; }
+    clean_section "Other interesting files"
+    awk -F'\t' -v limit=10 -v color="$C" -v nc="$NC" -v dim="$D" '
+        NR <= limit { printf "  %s[INTEREST]%s %s  %s\n", color, nc, $1, $2 }
+        END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }' "$tmp"
+    rm -f "$tmp"
+}
+
+count_interest_filter() {
+    local pattern="$1"
+    [ -s "$INTEREST_FILE" ] || { echo 0; return; }
+    awk -F'\t' -v pat="$pattern" '$1 ~ pat { print $0 }' "$INTEREST_FILE" | sort -u | wc -l | tr -d ' '
+}
+
+print_clean_summary() {
+    section "Clean findings summary"
+    log_line ""
+    log_line "=== Clean findings summary ==="
+
+    print_clean_tsv_findings "Directly usable credentials" "$HIGH_FILE" "HIGH" "$R" 25
+
+    if [ -s "$GUARANTEED_FILE" ]; then
+        clean_section "Credential containers"
+        sort -u "$GUARANTEED_FILE" | awk -F'\t' -v limit=25 -v color="$R" -v nc="$NC" -v dim="$D" '
+            NR <= limit { printf "  %s[CRITICAL]%s %-8s %s\n", color, nc, $1, $2 }
+            END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }'
+    fi
+
+    print_clean_tsv_findings "Private keys and auth material" "$KEY_FILE" "KEY" "$M" 25
+    print_clean_interest_filter "Encrypted credential leads" '^ENCRYPTED_CREDENTIAL_LEAD' "LEAD" "$C" 25
+    print_clean_interest_filter "References and user-artifact leads" '^(CREDENTIAL_LEAD|REFERENCE|USER_ARTIFACT)' "LEAD" "$Y" 25
+    print_clean_other_interest
+
+    local n_guar n_high n_key n_int n_name n_skip n_enc n_leads n_other
+    n_guar=$( [ -s "$GUARANTEED_FILE" ] && sort -u "$GUARANTEED_FILE" | wc -l | tr -d ' ' || echo 0)
+    n_high=$( [ -s "$HIGH_FILE" ] && sort -u "$HIGH_FILE" | wc -l | tr -d ' ' || echo 0)
+    n_key=$( [ -s "$KEY_FILE" ] && sort -u "$KEY_FILE" | wc -l | tr -d ' ' || echo 0)
+    n_int=$( [ -s "$INTEREST_FILE" ] && sort -u "$INTEREST_FILE" | wc -l | tr -d ' ' || echo 0)
+    n_name=$( [ -s "$NAME_FILE" ] && sort -u "$NAME_FILE" | wc -l | tr -d ' ' || echo 0)
+    n_skip=$( [ -s "$SKIPPED_FILE" ] && sort -u "$SKIPPED_FILE" | wc -l | tr -d ' ' || echo 0)
+    n_enc=$(count_interest_filter '^ENCRYPTED_CREDENTIAL_LEAD')
+    n_leads=$(count_interest_filter '^(CREDENTIAL_LEAD|REFERENCE|USER_ARTIFACT)')
+    n_other=$(( n_int - n_enc - n_leads ))
+    [ "$n_other" -lt 0 ] && n_other=0
+
+    clean_line ""
+    clean_line "${BOLD}${W}Counts${NC}"
+    clean_line "  HIGH: $n_high  KEY: $n_key  CONTAINERS: $n_guar  ENCRYPTED_LEADS: $n_enc  LEADS: $n_leads  OTHER_INTEREST: $n_other  NAME: $n_name  SKIPPED: $n_skip"
+
+    if [ -n "$OUTPUT_FILE" ]; then
+        clean_line ""
+        clean_line "${B}[*]${NC} Clean log written to ${W}${OUTPUT_FILE}${NC}"
+    fi
+}
+
 # ============================================================================
 #  Entry point
 # ============================================================================
@@ -2149,7 +2458,11 @@ main() {
         fi
     fi
 
-    print_summary
+    if [ "$CLEAN" -eq 1 ]; then
+        print_clean_summary
+    else
+        print_summary
+    fi
 
     if [ -s "$GUARANTEED_FILE" ] || [ -s "$HIGH_FILE" ] || [ -s "$KEY_FILE" ]; then
         exit 1
