@@ -3,7 +3,6 @@
 
 <img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/19a115de-0fc1-4745-ba61-b3a69994d07a" />
 
-
 <br>
 
 ![read-only](https://img.shields.io/badge/read--only-yes-3fb950?style=flat-square)
@@ -14,86 +13,166 @@
 
 </div>
 
-`credshunter` is a read-only credential finder for authorized post-exploitation. It walks a host once and surfaces the secrets you can actually **reuse** — passwords, keys, hashes, and credential files — while staying quiet on the cloud / SaaS tokens that only add noise.
+`credshunter` is a read-only credential finder for authorized post-exploitation, CTFs, labs, and internal assessments. It walks one or more paths and surfaces reusable secrets, encrypted credential leads, private keys, credential containers, and files that point to where credentials may be hiding.
 
-Two siblings, one behaviour: `credshunter.sh` for Linux, `credshunter.ps1` for Windows.
+Two siblings, one behavior: `credshunter.sh` for Linux and `credshunter.ps1` for Windows.
 
-## How it works
+## How It Works
 
-A five-stage funnel, narrowing from *where credentials live* to *what's inside files*. Each stage prints its findings the moment it finishes.
+A staged funnel narrows from known credential locations to suspicious files and content-level matches. The tool does not authenticate, spray, dump processes, exploit services, change files, or touch the network.
 
+```text
+ Stage 1   OS and user artifacts      registry, histories, vaults, sessions, shortcuts, workspaces
+ Stage 2   Credential containers      kdbx, ppk, pfx, keytab, axx, enc, gpg, renamed archives
+ Stage 3   High-value file types      keys, env files, backups, DBs, captures, configs
+ Stage 4   Suspicious filenames       password, secret, credential, backup, vault
+ Stage 5   Content scan               tuned regexes for reusable credentials and encrypted leads
 ```
- Stage 1   OS credential stores     registry · GPP · histories · vaults · keys · other
- Stage 2   Confirmed containers     .kdbx · .ppk · .pfx · .keytab · other
- Stage 3   High-value file types    keys · .env · backups · DBs · captures · other
- Stage 4   Suspicious filenames     *password* · *secret* · *credential*
- Stage 5   Content scan             70+ tuned regexes, one pass per file
-```
 
-Stages 1 and 5 do the heavy lifting; 2–4 are fast filename / extension passes. Every finding clears a false-positive filter before it reaches you.
+The newer reference-led checks also inspect files that commonly reveal where credentials live, such as shell histories, PowerShell history, VS Code workspaces, Sublime sessions, recent shortcuts, and similar user artifacts.
+
+## What It Finds
+
+CredsHunter focuses on local, reusable, or investigation-worthy credential material:
+
+| Category | Examples |
+|---|---|
+| Direct credentials | `password=...`, connection strings, basic auth URLs, WinRM/Impacket commands, PHP arrays, PHP `define()`, DB connect calls |
+| Private keys and auth material | SSH keys, PuTTY keys, PFX/P12, keytabs, SAM/SYSTEM hives, GPP `cpassword` |
+| Credential containers | KeePass `.kdbx`, encrypted archives, `.axx`, `.enc`, `.gpg`, `.pgp`, renamed ZIP/7z/RAR/GZip/TAR files |
+| Encrypted credential leads | Ansible Vault, SOPS encrypted values, Kubernetes SealedSecret, Kubernetes `encryptedData` |
+| Reference leads | Paths found in histories, recent files, shortcuts, editor sessions, and workspace files |
+| Interesting files | `.env`, backups, configs, database dumps, captures, likely credential filenames |
+
+Cloud and SaaS API token hunting is intentionally limited to reduce noise. Local cloud CLI credential files may still be listed as interesting artifacts.
 
 ## Usage
 
+Linux:
+
 ```bash
-# Linux — full sweep, log to file
+# Full filesystem sweep, verbose console, save everything for later
 ./credshunter.sh -p / -o loot.txt
 
-# Targeted, skip the slow content scan
+# Cleaner console summary while still exporting to a file
+./credshunter.sh -p / --clean -o loot.txt
+
+# Target common CTF/user locations
+./credshunter.sh -p /home -p /var/www -p /opt --clean -o loot.txt
+
+# Targeted scan, skip content scanning
 ./credshunter.sh -p /var/www -p /home --no-stage5
+
+# Pipe-friendly output
+./credshunter.sh -p /home --clean --no-color -o loot.txt
+```
+
+Windows:
+
+```powershell
+# Full C: sweep, verbose console, save everything for later
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\credshunter.ps1 -Path C:\ -OutputFile .\loot.txt
+
+# Cleaner console summary while still exporting to a file
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\credshunter.ps1 -Path C:\ -Clean -OutputFile .\loot.txt
+
+# Target common user/app locations
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\credshunter.ps1 -Path C:\Users -Path C:\inetpub -Clean -NoColor -OutputFile .\loot.txt
+
+# Web / DB box: also scan SQL and CSV dumps
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\credshunter.ps1 -Path D:\ -IncludeData
+```
+
+You do not need to be privileged to run it. Running as Administrator or root only increases what the OS allows the script to read.
+
+## Output Modes
+
+Default mode prints findings as each stage finishes. This is useful when you want full visibility during a scan, but it can be noisy on real systems.
+
+Clean mode keeps the console focused:
+
+```bash
+./credshunter.sh -p /home --clean -o loot.txt
 ```
 
 ```powershell
-# Windows — elevated sweep of C:\
-.\credshunter.ps1 -Path C:\ -OutputFile loot.txt
-
-# Web / DB box: also scan SQL & CSV dumps
-.\credshunter.ps1 -Path D:\ -IncludeData
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\credshunter.ps1 -Path C:\Users -Clean -OutputFile .\loot.txt
 ```
 
-Pipe-friendly — add `--no-color` / `-NoColor` and grep for a tier.
+In clean mode, the final console output is grouped into:
 
-## Output
+```text
+Directly usable credentials
+Credential containers
+Private keys and auth material
+Encrypted credential leads
+References and user-artifact leads
+Other interesting files
+Counts
+```
 
-Findings are grouped into five tiers, loudest first.
+`-o` / `-OutputFile` still works with clean mode, so you can keep a file for later review while keeping the terminal readable.
+
+Use `--no-color` / `-NoColor` when redirecting output, pasting results into reports, running in limited terminals, or processing with tools like `grep`, `findstr`, or `Select-String`.
+
+## Output Tags
+
+Findings are grouped by severity and type:
 
 | Tag | Meaning |
 |---|---|
-| `[CRITICAL]` | Confirmed credential container |
-| `[HIGH]` | Reusable password · hash · GPP cpassword |
-| `[KEY]` | Private key or readable SAM / SYSTEM hive |
-| `[INTEREST]` | High-value file worth a look |
-| `[NAME]` | Suspicious filename — review hint |
+| `[CRITICAL]` | Confirmed credential container or highly sensitive credential artifact |
+| `[HIGH]` | Reusable password, hash, connection string, GPP cpassword, command-line credential |
+| `[KEY]` | Private key or readable auth material such as SAM/SYSTEM hives |
+| `[ENCRYPTED_CREDENTIAL_LEAD]` | Encrypted secret block that needs a password/key to decrypt |
+| `[CREDENTIAL_LEAD]` | Artifact likely to contain or point to credential material |
+| `[REFERENCE]` | Path reference found in user artifacts, histories, editor sessions, or shortcuts |
+| `[INTEREST]` | High-value file worth reviewing |
+| `[NAME]` | Suspicious filename review hint |
 
-The exit code is `1` whenever anything lands in CRITICAL / HIGH / KEY — handy for CI:
-`./credshunter.sh -p /etc && echo clean`.
+The exit code is `1` whenever anything lands in `CRITICAL`, `HIGH`, or `KEY`; otherwise it exits `0`.
 
 ## Tuning
 
-| Want to… | Do this |
-|---|---|
-| Limit scope | `-p` / `-Path` to include, `-x` / `-ExcludePath` to skip |
-| Scan every file | `-a` / `-All` |
-| Add SQL / CSV dumps | `-IncludeData` *(PowerShell)* |
-| Change the size cap | `-m N` / `-MaxFileSizeMB N`, or `--no-size-limit` / `-NoSizeLimit` |
-| Skip a stage | `--no-stageN` / `-NoStageN` |
+| Want to... | Linux | Windows |
+|---|---|---|
+| Limit scope | `-p /path` | `-Path C:\Path` |
+| Exclude a path | `-x /path` | `-ExcludePath C:\Path` |
+| Clean summary | `--clean` | `-Clean` |
+| Disable colors | `--no-color` | `-NoColor` |
+| Save output | `-o loot.txt` | `-OutputFile .\loot.txt` |
+| Scan every file | `-a` / `--all` | `-All` |
+| Change size cap | `-m N` / `--max-file-size-mb N` | `-MaxFileSizeMB N` |
+| Disable size cap | `--no-size-limit` | `-NoSizeLimit` |
+| Skip a stage | `--no-stageN` | `-NoStageN` |
+| Include SQL/CSV dumps | default set plus options | `-IncludeData` |
 
-Patterns and file-type lists live in clearly-labelled arrays near the top of each script — edit one place, nothing else needed.
+Patterns and file-type lists live in clearly labeled arrays near the top of each script.
 
 ## FAQ
 
-**Does it change anything on the host?**
-No. It writes only to the log file you choose, never touches the network, and exits cleanly on Ctrl-C.
+**Does it change anything on the host?**  
+No. It is read-only, writes only to the output file you choose, never touches the network, and exits cleanly on Ctrl-C.
 
-**Why ignore AWS / GitHub / Slack tokens?**
-By design — they rarely help with in-network movement and are the top source of false positives. Local cloud-CLI credential *files* are still listed.
+**Why can a full disk scan take a long time?**  
+Full disk scans walk a lot of files and Stage 5 reads file content. In CTFs and labs, scans are usually faster because the target paths are smaller. For speed, scan likely locations first: `/home`, `/var/www`, `/opt`, `C:\Users`, `C:\inetpub`, app folders, backup folders, and web roots.
 
-**Stage 5 feels slow, or a password was missed.**
-Verbose logs are the usual cost — they're bounded by the size cap. Narrow with `-p`, skip content scanning with `--no-stage5`, and confirm the target isn't over the size cap, in an excluded path, or an extension outside the Stage 5 set (use `-All` to be sure).
+**What does an encrypted credential lead mean?**  
+It means CredsHunter found something that probably contains a secret, but the value is encrypted. Examples include Ansible Vault, SOPS, and SealedSecret data. The report shows the file and marker so you know where to focus next.
 
+**Why use clean mode?**  
+Clean mode is better for quick triage and reports. Default mode is better when you want to watch each stage and see every raw finding as it appears.
 
+**Why use no-color?**  
+Colors are helpful in an interactive terminal, but ANSI color codes can be annoying in redirected output, report snippets, or text processing. `--no-color` / `-NoColor` keeps the output plain.
+
+**A password was missed. What should I check?**  
+Confirm the target path is included, the file is under the size cap, the path is not excluded, and the extension is scanned by Stage 5. Use `-All` / `--all` for broader content scanning.
 
 ## Wiki
+
 Check out the [Wiki Document](https://github.com/NeCr00/Credential-Hunting/wiki) for more information about the project.
 
 ## Contribute
-Feel free to contribute on the project !
+
+Feel free to contribute to the project.
