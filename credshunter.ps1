@@ -660,6 +660,9 @@ function Test-FalsePositive { param([string]$Value)
     # Function-call accessor (getPassword(), get_password(), cfg.getSecret()) --
     # code that fetches a secret at runtime, not a hardcoded literal.
     if ($v -match '^[A-Za-z_][A-Za-z0-9_.]*\(.*\)$')                             { return $true }
+    # Runtime decryptor call/reference, not a literal password. The decryptor
+    # and hardcoded parameters are reported separately as leads.
+    if ($lower -match 'decrypt.*\(')                                               { return $true }
 
     # Template / interpolation markers
     if ($v -match '\$\{[^}]+\}')                  { return $true }
@@ -1486,8 +1489,53 @@ function Invoke-EncryptedSecretLeadDetection {
                 Add-EncryptedSecretLead -Kind 'kubernetes_sealed_secret' -Path $FullPath -LineNumber $lineNo -Reason 'Kubernetes SealedSecret manifest'
                 continue
             }
+            if ($line -match '(?i)<(Password|Passphrase|Passwd|Pwd)>\s*([A-Za-z0-9+/]{20,}={0,2})\s*</(Password|Passphrase|Passwd|Pwd)>') {
+                Add-EncryptedSecretLead -Kind 'xml_password_ciphertext' -Path $FullPath -LineNumber $lineNo -Reason 'XML password-like tag contains base64 ciphertext'
+                continue
+            }
+            if ($line -match '(?i)(DecryptString|DecryptPassword|DecryptSecret|Decrypt)\s*\(.*(Password|Passphrase|Passwd|Pwd|Secret|Credential)') {
+                Add-EncryptedSecretLead -Kind 'decrypt_call_reference' -Path $FullPath -LineNumber $lineNo -Reason 'code decrypts a sensitive config value at runtime'
+                continue
+            }
             if (Test-EncryptedSecretValueLine -Line $line) {
                 Add-EncryptedSecretLead -Kind 'encrypted_secret_value' -Path $FullPath -LineNumber $lineNo -Reason 'sensitive key contains encrypted/vaulted value'
+            }
+        }
+    } finally {
+        $reader.Dispose()
+    }
+}
+
+function Invoke-DecryptableConfigLeadDetection {
+    param([string]$FullPath, [string]$Content, [string]$SourceLabel = 'content')
+    if ([string]::IsNullOrEmpty($Content)) { return }
+    if ($Content -notmatch '(?i)Rfc2898DeriveBytes|PasswordDeriveBytes|PBKDF2|RijndaelManaged|AesManaged|AesCryptoServiceProvider|CipherMode\.CBC|AES-256-CBC|MODE_CBC|DecryptString|DecryptPassword|DecryptSecret') {
+        return
+    }
+    $reader = New-Object System.IO.StringReader($Content)
+    try {
+        $lineNo = 0
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $lineNo++
+            if ($lineNo -gt 5000) { break }
+            if ($line -match '(?i)Rfc2898DeriveBytes|PasswordDeriveBytes|PBKDF2|RijndaelManaged|AesManaged|AesCryptoServiceProvider|CipherMode\.CBC|AES-256-CBC|MODE_CBC') {
+                Add-EncryptedSecretLead -Kind 'dotnet_crypto_decryptor' -Path $FullPath -LineNumber $lineNo -Reason 'hardcoded/local decryptor logic may recover config secrets'
+                continue
+            }
+            if ($line -match '(?i)(DecryptString|DecryptPassword|DecryptSecret|Decrypt)\s*\(.*(Password|Passphrase|Passwd|Pwd|Secret|Credential)') {
+                Add-EncryptedSecretLead -Kind 'decrypt_call_reference' -Path $FullPath -LineNumber $lineNo -Reason 'code decrypts a sensitive config value at runtime'
+                continue
+            }
+            if ($line -match '(?i)\b(passphrase|password|encryptionKey|secretKey|cryptoKey)[A-Za-z0-9_]*\b\s*(?:As\s+String\s*)?=\s*["'']([^"'']{3,})["'']') {
+                $value = $Matches[2]
+                if (-not (Test-FalsePositive -Value $value)) {
+                    Add-Finding -Bucket High -Label "$SourceLabel/hardcoded_crypto_key" -Path $FullPath -LineNumber $lineNo -Preview $line.Trim()
+                }
+                continue
+            }
+            if ($line -match '(?i)\b(salt(?:Value)?|initVector|ivs?|iv)[A-Za-z0-9_]*\b\s*(?:As\s+String\s*)?=\s*["'']([^"'']{3,})["'']') {
+                Add-Interesting -Category 'CREDENTIAL_LEAD/crypto_parameter' -Path ("{0}:{1} {2}" -f $FullPath, $lineNo, $line.Trim())
+                continue
             }
         }
     } finally {
@@ -1718,6 +1766,7 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
     if ([string]::IsNullOrEmpty($content)) { return }
 
     Invoke-EncryptedSecretLeadDetection -FullPath $FullPath -Content $content
+    Invoke-DecryptableConfigLeadDetection -FullPath $FullPath -Content $content -SourceLabel $SourceLabel
 
     if (Test-ReferenceCarrierName -Name $bn -SourceLabel $SourceLabel) {
         Invoke-ReferenceExtraction -FullPath $FullPath -Content $content -Application $SourceLabel

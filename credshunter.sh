@@ -778,6 +778,9 @@ is_false_positive() {
     # ── Function-call accessor (getPassword(), get_password(), cfg.getSecret())
     # — code that FETCHES a secret at runtime, not a hardcoded literal.
     [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_.]*\(.*\)$ ]] && return 0
+    # Runtime decryptor call/reference, not a literal password. The decryptor
+    # and hardcoded parameters are reported separately as leads.
+    [[ "$lower" == *decrypt*"("* ]] && return 0
 
     # Variable interpolation / template markers
     case "$v" in
@@ -1034,8 +1037,43 @@ detect_encrypted_secret_leads() {
             record_encrypted_secret_lead "kubernetes_sealed_secret" "$file" "$lineno" "Kubernetes SealedSecret manifest"
             continue
         fi
+        if [[ "$line" =~ \<(Password|Passphrase|Passwd|Pwd)\>[[:space:]]*([A-Za-z0-9+/]{20,}={0,2})[[:space:]]*\</(Password|Passphrase|Passwd|Pwd)\> ]]; then
+            record_encrypted_secret_lead "xml_password_ciphertext" "$file" "$lineno" "XML password-like tag contains base64 ciphertext"
+            continue
+        fi
+        if [[ "$line" =~ (DecryptString|DecryptPassword|DecryptSecret|Decrypt)[[:space:]]*\(.*(Password|Passphrase|Passwd|Pwd|Secret|Credential) ]]; then
+            record_encrypted_secret_lead "decrypt_call_reference" "$file" "$lineno" "code decrypts a sensitive config value at runtime"
+            continue
+        fi
         if encrypted_secret_value_line "$line"; then
             record_encrypted_secret_lead "encrypted_secret_value" "$file" "$lineno" "sensitive key contains encrypted/vaulted value"
+        fi
+    done <"$file"
+}
+
+detect_decryptable_config_leads() {
+    local file="$1" source_label="${2:-content}" line lineno=0 value
+    grep -aEiq '(Rfc2898DeriveBytes|PasswordDeriveBytes|PBKDF2|RijndaelManaged|AesManaged|AesCryptoServiceProvider|CipherMode[.]CBC|AES-256-CBC|MODE_CBC|DecryptString|DecryptPassword|DecryptSecret)' "$file" 2>/dev/null || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        [ "$lineno" -gt 5000 ] && break
+        if [[ "$line" =~ (Rfc2898DeriveBytes|PasswordDeriveBytes|PBKDF2|RijndaelManaged|AesManaged|AesCryptoServiceProvider|CipherMode[.]CBC|AES-256-CBC|MODE_CBC) ]]; then
+            record_encrypted_secret_lead "dotnet_crypto_decryptor" "$file" "$lineno" "hardcoded/local decryptor logic may recover config secrets"
+            continue
+        fi
+        if [[ "$line" =~ (DecryptString|DecryptPassword|DecryptSecret|Decrypt)[[:space:]]*\(.*(Password|Passphrase|Passwd|Pwd|Secret|Credential) ]]; then
+            record_encrypted_secret_lead "decrypt_call_reference" "$file" "$lineno" "code decrypts a sensitive config value at runtime"
+            continue
+        fi
+        if [[ "$line" =~ (passphrase|password|encryptionKey|secretKey|cryptoKey)[A-Za-z0-9_]*[[:space:]]*(As[[:space:]]+String[[:space:]]*)?=[[:space:]]*[\'\"]([^\'\"\$]{3,})[\'\"] ]]; then
+            value="${BASH_REMATCH[3]}"
+            is_false_positive "$value" && continue
+            record_finding HIGH "${source_label}/hardcoded_crypto_key" "$file" "$lineno" "$(sanitize "$line")"
+            continue
+        fi
+        if [[ "$line" =~ (salt(Value)?|initVector|iv(s)?)[A-Za-z0-9_]*[[:space:]]*(As[[:space:]]+String[[:space:]]*)?=[[:space:]]*[\'\"]([^\'\"\$]{3,})[\'\"] ]]; then
+            record_interest "CREDENTIAL_LEAD/crypto_parameter" "$file:$lineno $(sanitize "$line")"
+            continue
         fi
     done <"$file"
 }
@@ -1437,6 +1475,7 @@ scan_file() {
     fi
     is_binary "$file" && { record_skip "$file" "binary"; return; }
     detect_encrypted_secret_leads "$file"
+    detect_decryptable_config_leads "$file" "$source_label"
     if reference_carrier_name "$file" "$source_label"; then
         extract_reference_leads "$file" "$source_label"
     fi
