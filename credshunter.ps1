@@ -325,6 +325,8 @@ $script:RawPatterns = @(
        Regex = '(?i)cpassword\s*=\s*"([A-Za-z0-9+/=]{20,})"' }
     @{ Label = 'unattend_password';
        Regex = '(?is)<(?:Administrator)?Password>\s*<Value>([^<]{2,})(?:</Value>)?' }
+    @{ Label = 'xml_password_tag';
+       Regex = '(?i)<(Password|Passphrase|Passwd|Pwd)>\s*([^\s<][^<]{2,})</(Password|Passphrase|Passwd|Pwd)>' }
     # `["']?` before the operator so the canonical .reg export form
     # "DefaultPassword"="value" is matched (now that UTF-16 .reg files are read).
     @{ Label = 'autologon_password';
@@ -1545,6 +1547,7 @@ function Get-ReferenceCandidates {
             $r = $r -replace '^file:///', ''
             $r = $r -replace '/', '\'
             if ($r.Length -lt 4) { continue }
+            if ($r -match '^[a-z][a-z0-9+.-]*:\\\\' -and $r -notmatch '^file:\\\\') { continue }
             if ($seen.Add($r)) { $refs.Add($r) }
             if ($refs.Count -ge 100) { return ,$refs }
         }
@@ -1835,6 +1838,10 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
                 $p.Label -eq 'php_db_connect' -or $p.Label -eq 'autologon_password') {
                 $mq = [regex]::Match($line, '["'']([^"'']+)["''][^"'']*$')
                 if ($mq.Success) { $value = $mq.Groups[1].Value }
+            }
+            if ($p.Label -eq 'xml_password_tag') {
+                $mq = [regex]::Match($line, '(?i)<(Password|Passphrase|Passwd|Pwd)>\s*([^<]+)</(Password|Passphrase|Passwd|Pwd)>')
+                if ($mq.Success) { $value = $mq.Groups[2].Value.Trim() }
             }
 
             # -- Hard-coded line-level FP filter (real-host noise) --

@@ -528,6 +528,7 @@ CRED_PATTERNS=(
 
     # ── Windows unattend / autologon ─────────────────────────────────────
     'unattend_password|<(Administrator)?Password>[[:space:]]*<Value>[^<]{2,}'
+    'xml_password_tag|<(Password|Passphrase|Passwd|Pwd)>[[:space:]]*[^<[:space:]][^<]{2,}</(Password|Passphrase|Passwd|Pwd)>'
     'autologon_password|(DefaultPassword|AltDefaultPassword)[[:space:]]*[:=][[:space:]"]*[^[:space:]"#]{2,}'
 
     # ── Environment-variable credentials ─────────────────────────────────
@@ -1089,7 +1090,7 @@ extract_references_from_file() {
         sed 's/\\\\/\\/g' |
         grep -aEo 'file://[^[:space:]"'"'"'<>]+|[A-Za-z]:\\[^[:space:]"'"'"'<>|]+|\\\\[^[:space:]"'"'"'<>|]+|/(home|root|etc|var|opt|srv|tmp|mnt|media|run|backup|Users)/[^[:space:]"'"'"'<>]+|([A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+:/[^[:space:]"'"'"'<>]+' 2>/dev/null |
         sed 's/[",;)}\]]*$//' |
-        awk 'length($0) >= 4 && !seen[tolower($0)]++ { print; if (++n >= 100) exit }'
+        awk '{ low=tolower($0); if (low !~ /^[a-z][a-z0-9+.-]*:\/\// || low ~ /^file:\/\//) { if (length($0) >= 4 && !seen[low]++) { print; if (++n >= 100) exit } } }'
 }
 
 inspect_referenced_target() {
@@ -1355,6 +1356,11 @@ classify_line() {
                 drupal_password|php_array_secret|wp_db_password)
                     if [[ "$content" =~ .*[\'\"]([^\'\"]+)[\'\"][^\'\"]*$ ]]; then
                         value="${BASH_REMATCH[1]}"
+                    fi
+                    ;;
+                xml_password_tag)
+                    if [[ "$content" =~ \<(Password|Passphrase|Passwd|Pwd)\>[[:space:]]*([^[:space:]\<][^\<]{2,})\</(Password|Passphrase|Passwd|Pwd)\> ]]; then
+                        value="${BASH_REMATCH[2]}"
                     fi
                     ;;
             esac
