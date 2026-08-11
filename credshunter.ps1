@@ -1515,15 +1515,23 @@ function Invoke-DecryptableConfigLeadDetection {
     $reader = New-Object System.IO.StringReader($Content)
     try {
         $lineNo = 0
+        $decryptorReported = $false
+        $decryptCallReported = $false
         while ($null -ne ($line = $reader.ReadLine())) {
             $lineNo++
             if ($lineNo -gt 5000) { break }
             if ($line -match '(?i)Rfc2898DeriveBytes|PasswordDeriveBytes|PBKDF2|RijndaelManaged|AesManaged|AesCryptoServiceProvider|CipherMode\.CBC|AES-256-CBC|MODE_CBC') {
-                Add-EncryptedSecretLead -Kind 'dotnet_crypto_decryptor' -Path $FullPath -LineNumber $lineNo -Reason 'hardcoded/local decryptor logic may recover config secrets'
+                if (-not $decryptorReported) {
+                    Add-EncryptedSecretLead -Kind 'dotnet_crypto_decryptor' -Path $FullPath -LineNumber $lineNo -Reason 'hardcoded/local decryptor logic may recover config secrets'
+                    $decryptorReported = $true
+                }
                 continue
             }
             if ($line -match '(?i)(DecryptString|DecryptPassword|DecryptSecret|Decrypt)\s*\(.*(Password|Passphrase|Passwd|Pwd|Secret|Credential)') {
-                Add-EncryptedSecretLead -Kind 'decrypt_call_reference' -Path $FullPath -LineNumber $lineNo -Reason 'code decrypts a sensitive config value at runtime'
+                if (-not $decryptCallReported) {
+                    Add-EncryptedSecretLead -Kind 'decrypt_call_reference' -Path $FullPath -LineNumber $lineNo -Reason 'code decrypts a sensitive config value at runtime'
+                    $decryptCallReported = $true
+                }
                 continue
             }
             if ($line -match '(?i)\b(passphrase|password|encryptionKey|secretKey|cryptoKey)[A-Za-z0-9_]*\b\s*(?:As\s+String\s*)?=\s*["'']([^"'']{3,})["'']') {

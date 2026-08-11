@@ -1053,16 +1053,23 @@ detect_encrypted_secret_leads() {
 
 detect_decryptable_config_leads() {
     local file="$1" source_label="${2:-content}" line lineno=0 value
+    local decryptor_reported=0 decrypt_call_reported=0
     grep -aEiq '(Rfc2898DeriveBytes|PasswordDeriveBytes|PBKDF2|RijndaelManaged|AesManaged|AesCryptoServiceProvider|CipherMode[.]CBC|AES-256-CBC|MODE_CBC|DecryptString|DecryptPassword|DecryptSecret)' "$file" 2>/dev/null || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         lineno=$((lineno + 1))
         [ "$lineno" -gt 5000 ] && break
         if [[ "$line" =~ (Rfc2898DeriveBytes|PasswordDeriveBytes|PBKDF2|RijndaelManaged|AesManaged|AesCryptoServiceProvider|CipherMode[.]CBC|AES-256-CBC|MODE_CBC) ]]; then
-            record_encrypted_secret_lead "dotnet_crypto_decryptor" "$file" "$lineno" "hardcoded/local decryptor logic may recover config secrets"
+            if [ "$decryptor_reported" -eq 0 ]; then
+                record_encrypted_secret_lead "dotnet_crypto_decryptor" "$file" "$lineno" "hardcoded/local decryptor logic may recover config secrets"
+                decryptor_reported=1
+            fi
             continue
         fi
         if [[ "$line" =~ (DecryptString|DecryptPassword|DecryptSecret|Decrypt)[[:space:]]*\(.*(Password|Passphrase|Passwd|Pwd|Secret|Credential) ]]; then
-            record_encrypted_secret_lead "decrypt_call_reference" "$file" "$lineno" "code decrypts a sensitive config value at runtime"
+            if [ "$decrypt_call_reported" -eq 0 ]; then
+                record_encrypted_secret_lead "decrypt_call_reference" "$file" "$lineno" "code decrypts a sensitive config value at runtime"
+                decrypt_call_reported=1
+            fi
             continue
         fi
         if [[ "$line" =~ (passphrase|password|encryptionKey|secretKey|cryptoKey)[A-Za-z0-9_]*[[:space:]]*(As[[:space:]]+String[[:space:]]*)?=[[:space:]]*[\'\"]([^\'\"\$]{3,})[\'\"] ]]; then
