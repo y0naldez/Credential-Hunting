@@ -334,7 +334,10 @@ $script:RawPatterns = @(
 
     # ---- Environment-variable credentials ----------------------------------
     @{ Label = 'env_password';
-       Regex = '(?im)(^|\s)(set\s+|export\s+|setx\s+)?[A-Z][A-Z0-9_]*(PASSWORD|PASSWD|PASSPHRASE)[A-Z0-9_]*\s*=\s*["'']?[^\s"<>]{3,}' }
+       # Keep the variable name case-sensitive/uppercase even though the rest
+       # of the pattern is case-insensitive. This prevents XML attributes such
+       # as enablePasswordRetrieval="false" from masquerading as env secrets.
+       Regex = '(?im)(^|\s)(set\s+|export\s+|setx\s+)?(?-i:[A-Z][A-Z0-9_]*(?:PASSWORD|PASSWD|PASSPHRASE)[A-Z0-9_]*)\s*=\s*["'']?[^\s"<>]{3,}' }
     @{ Label = 'pgpassword_env';
        Regex = '(?im)\bPGPASSWORD\s*=\s*["'']?[^\s"#]{3,}' }
     @{ Label = 'mysql_pwd_env';
@@ -473,7 +476,10 @@ $script:RawPatterns = @(
     @{ Label = 'htpasswd_hash';
        Regex = '(?m)^[^:\s#]+:\$(apr1|2[aby]?|5|6|y)\$' }
     @{ Label = 'netrc_password';
-       Regex = '(?im)^\s*(machine\s+\S+\s+)?(login|user|username)\s+\S+\s+password\s+\S{2,}' }
+       # .netrc uses the `login <name> password <secret>` grammar. Accepting
+       # generic "user/username" made prose such as "Username and Password
+       # authentication kind" look like a reusable credential.
+       Regex = '(?im)^\s*(machine\s+\S+\s+)?login\s+\S+\s+password\s+\S{2,}' }
     @{ Label = 'samba_password';
        Regex = '(?im)^\s*(passwd|password|smb\s+passwd)\s*=\s*\S{3,}' }
     # sudoers NOPASSWD entry (referenced by NoFPCheck; previously had no
@@ -1559,7 +1565,12 @@ function Invoke-DecryptableConfigLeadDetection {
         while ($null -ne ($line = $reader.ReadLine())) {
             $lineNo++
             if ($lineNo -gt 5000) { break }
-            if ($line -match '(?i)Rfc2898DeriveBytes|PasswordDeriveBytes|PBKDF2|RijndaelManaged|AesManaged|AesCryptoServiceProvider|CipherMode\.CBC|AES-256-CBC|MODE_CBC') {
+            # Require an invocation/constructor shape, not a bare class name.
+            # API documentation XML commonly lists Rfc2898DeriveBytes and AES
+            # types but contains no locally usable decryptor logic.
+            if ($line -match '(?i)\b(?:Rfc2898DeriveBytes|PasswordDeriveBytes|RijndaelManaged|AesManaged|AesCryptoServiceProvider)\s*\(' -or
+                $line -match '(?i)\b(?:new\s+|New-Object\s+)(?:System\.Security\.Cryptography\.)?(?:Rfc2898DeriveBytes|PasswordDeriveBytes|RijndaelManaged|AesManaged|AesCryptoServiceProvider)\b' -or
+                $line -match '(?i)\[(?:System\.Security\.Cryptography\.)?(?:Rfc2898DeriveBytes|PasswordDeriveBytes|RijndaelManaged|AesManaged|AesCryptoServiceProvider)\]\s*::\s*new\s*\(') {
                 if (-not $decryptorReported) {
                     Add-EncryptedSecretLead -Kind 'dotnet_crypto_decryptor' -Path $FullPath -LineNumber $lineNo -Reason 'hardcoded/local decryptor logic may recover config secrets'
                     $decryptorReported = $true
@@ -1608,6 +1619,25 @@ function Get-ArtifactMagicKind {
         if ($ascii.StartsWith('-----BEGIN ')) { return 'pem_material' }
     } catch {}
     return $null
+}
+
+function Test-PemPrivateMaterial { param([string]$FullPath)
+    $fs = $null
+    try {
+        $fs = [System.IO.File]::Open($FullPath, 'Open', 'Read', 'ReadWrite')
+        $cap = [Math]::Min([long]$fs.Length, 1MB)
+        $buf = New-Object byte[] ([int]$cap)
+        $read = $fs.Read($buf, 0, $buf.Length)
+        if ($read -le 0) { return $false }
+        $text = [System.Text.Encoding]::ASCII.GetString($buf, 0, $read)
+        return ($text -match '-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----')
+    } catch {
+        # If an otherwise high-value PEM cannot be inspected, retain it rather
+        # than silently dropping a potentially useful private key.
+        return $true
+    } finally {
+        if ($fs) { try { $fs.Dispose() } catch {} }
+    }
 }
 
 function Test-ReferenceCarrierName {
@@ -1710,6 +1740,24 @@ function Invoke-ReferenceExtraction {
     }
 }
 
+# Most Windows shortcuts point to Explorer, Control Panel, PowerShell, or a
+# normal application. Surface only shortcut targets that themselves look
+# credential-bearing; generic .lnk inventory drowns the clean summary without
+# providing a reusable lead.
+function Test-ShortcutCredentialTarget { param([string]$Target)
+    if ([string]::IsNullOrWhiteSpace($Target)) { return $false }
+    if (@(Get-ServiceCommandCredential -CommandLine $Target).Count -gt 0) { return $true }
+    if ($Target -match '(?i)\b(?:cmdkey|runas|net\s+use|psexec|wmic|schtasks|sshpass|plink)\b.*(?:pass|/p:|-pw\b|-p\s+)') { return $true }
+    if ($Target -match '(?i)(?:^|[\\/])[^\\/]*(?:credential|secret|password|passwd)[^\\/]*(?:\s|$)') { return $true }
+    if ($Target -match '(?i)\.(?:kdbx?|psafe3|ppk|pfx|p12|pvk|keytab|bek|dpapimk|env|netrc|pgpass)(?:\s|$)') { return $true }
+    # Preserve links (or Notepad/editor arguments) that point to content the
+    # scanner can actually inspect. The destination does not need a suspicious
+    # name: notes.txt or an ordinary app.config may still hold a password.
+    if ($Target -match '(?i)\.(?:txt|text|log|logs|conf|config|cfg|cnf|ini|env|yaml|yml|toml|json|jsonc|xml|properties|settings|ps1|psm1|bat|cmd|vbs|py|php|cs|js|ts|rdp|rdg|reg|url)["'']?(?:\s|$)') { return $true }
+    if ($Target -match '(?i)(?:^|[\\/])(?:unattend(?:ed)?\.xml|autounattend\.xml|web\.config|appsettings[^\\/]*\.json|consolehost_history\.txt)(?:\s|$)') { return $true }
+    return $false
+}
+
 function Invoke-ShortcutReferenceExtraction {
     param([string]$FullPath)
     $targets = [System.Collections.Generic.List[string]]::new()
@@ -1730,7 +1778,7 @@ function Invoke-ShortcutReferenceExtraction {
     }
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($t in $targets) {
-        if ($seen.Add($t)) {
+        if ($seen.Add($t) -and (Test-ShortcutCredentialTarget -Target $t)) {
             Add-ReferenceLead -SourcePath $FullPath -Target $t -Application 'windows_shortcut' -Reason '.lnk target/strings'
         }
     }
@@ -2847,10 +2895,16 @@ function Test-WindowsServices {
                 $imagePath = "$($props.ImagePath)".Trim()
             }
 
+            $serviceType = 0
+            if ($props.PSObject.Properties.Match('Type').Count -gt 0) {
+                try { $serviceType = [int]$props.Type } catch { $serviceType = 0 }
+            }
+
             # Built-in and virtual service identities are expected. A local,
             # domain, gMSA, or other custom account is valuable context even
             # though SCM's corresponding password is protected by LSA.
-            if ($account -and $account -notmatch '(?i)^(LocalSystem|\.\\LocalSystem|NT AUTHORITY\\(?:LocalService|NetworkService)|NT SERVICE\\.+)$') {
+            if (($serviceType -eq 0 -or ($serviceType -band 0x30) -ne 0) -and
+                $account -and $account -notmatch '(?i)^(LocalSystem|\.\\LocalSystem|NT AUTHORITY\\(?:LocalService|NetworkService)|NT SERVICE\\.+)$') {
                 $detail = "service[$serviceName] account=$account"
                 if ($imagePath) { $detail += " ImagePath=$imagePath" }
                 Add-Interesting -Category 'windows_service_account' -Path $detail
@@ -3028,8 +3082,12 @@ function Find-HighValueFiles { param($Files)
         # Stage3ExactNamesSet are OrdinalIgnoreCase, so the lowercased Name works.
         if ($script:SkipDbFilenames.Contains($f.Name)) { continue }
 
+        # A .pem containing only public certificates (for example cacerts.pem)
+        # is not reusable authentication material. Keep PEMs with private-key
+        # blocks and conservatively keep unreadable PEMs.
+        if ($f.Ext -eq '.pem' -and -not (Test-PemPrivateMaterial -FullPath $f.Path)) { continue }
+
         if ($f.Ext -eq '.lnk') {
-            Add-Interesting -Category 'USER_ARTIFACT/shortcut' -Path $f.Path
             Invoke-ShortcutReferenceExtraction -FullPath $f.Path
             continue
         }
@@ -3176,9 +3234,10 @@ function Write-FindingsSection {
     Write-LogLine ""
     Write-LogLine "=== $Title ==="
     foreach ($f in $List | Sort-Object Label, Path, LineNumber) {
-        Write-Host ("  $Color[$Tag]$($script:CNC) $($script:CD)$($f.Label)$($script:CNC)  $($script:CY)$($f.Path):$($f.LineNumber)$($script:CNC)")
+        $location = if ($f.LineNumber -gt 0) { "$($f.Path):$($f.LineNumber)" } else { $f.Path }
+        Write-Host ("  $Color[$Tag]$($script:CNC) $($script:CD)$($f.Label)$($script:CNC)  $($script:CY)$location$($script:CNC)")
         Write-Host ("       $($script:CD)$($f.Preview)$($script:CNC)")
-        Write-LogLine ("[$Tag] $($f.Label) $($f.Path):$($f.LineNumber)  $($f.Preview)")
+        Write-LogLine ("[$Tag] $($f.Label) $location  $($f.Preview)")
     }
 }
 
@@ -3218,7 +3277,8 @@ function Write-CleanSummary {
     $high = @($script:HighFindings | Sort-Object Path, LineNumber, Label)
     Write-CleanFindings -Title "Directly usable credentials" -Items $high -Limit $top -Renderer {
         param($f)
-        Write-CleanLine ("  $($script:CR)[HIGH]$($script:CNC) {0}  $($script:CD){1}: line {2}$($script:CNC)" -f $f.Label, $f.Path, $f.LineNumber)
+        $location = if ($f.LineNumber -gt 0) { "{0}: line {1}" -f $f.Path, $f.LineNumber } else { $f.Path }
+        Write-CleanLine ("  $($script:CR)[HIGH]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $f.Label, $location)
         if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
     }
 
@@ -3231,7 +3291,8 @@ function Write-CleanSummary {
     $keys = @($script:KeyFindings | Sort-Object Path, LineNumber, Label)
     Write-CleanFindings -Title "Private keys and auth material" -Items $keys -Limit $top -Renderer {
         param($f)
-        Write-CleanLine ("  $($script:CM)[KEY]$($script:CNC) {0}  $($script:CD){1}: line {2}$($script:CNC)" -f $f.Label, $f.Path, $f.LineNumber)
+        $location = if ($f.LineNumber -gt 0) { "{0}: line {1}" -f $f.Path, $f.LineNumber } else { $f.Path }
+        Write-CleanLine ("  $($script:CM)[KEY]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $f.Label, $location)
         if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
     }
 
