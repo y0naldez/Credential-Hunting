@@ -712,6 +712,45 @@ function Test-FalsePositive { param([string]$Value)
     return $false
 }
 
+# Return credential-bearing fragments found in a Windows service command line.
+# Service Control Manager passwords are normally stored as LSA secrets and are
+# not readable from the Services registry tree. This helper targets the unsafe
+# cases we CAN observe read-only: a password passed literally in ImagePath (or
+# another service parameter), including user/password URL authority forms.
+function Get-ServiceCommandCredential { param([string]$CommandLine)
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return @() }
+
+    $patterns = @(
+        @{ Label = 'password_argument'; Regex = '(?i)(?:^|\s)(?:--?password|--?passwd|--?passphrase|--?pwd|--?pass|-pw|/(?:password|passwd|pass|pwd))\s*(?:=|:\s*|\s+)\s*(?:"(?<secret>[^"]+)"|''(?<secret>[^'']+)''|(?<secret>[^\s"]+))' }
+        @{ Label = 'password_assignment'; Regex = '(?i)\b(?:password|passwd|passphrase|pwd)\s*=\s*(?:"(?<secret>[^"]+)"|''(?<secret>[^'']+)''|(?<secret>[^\s;]+))' }
+        @{ Label = 'url_credentials'; Regex = '(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]+:(?<secret>[^\s/@]+)@' }
+    )
+
+    foreach ($p in $patterns) {
+        $m = [regex]::Match($CommandLine, $p.Regex)
+        if (-not $m.Success) { continue }
+        $secret = $m.Groups['secret'].Value.Trim().TrimEnd(',', ';')
+        if (-not (Test-FalsePositive -Value $secret)) {
+            return ,([pscustomobject]@{ Label = $p.Label; Secret = $secret })
+        }
+    }
+
+    # A bare -p is ambiguous (often a port). Treat it as a password only when
+    # the same command also supplies a user/account option, a common wrapper
+    # pattern used by third-party Windows services.
+    if ($CommandLine -match '(?i)(?:^|\s)(?:--?user(?:name)?|-u|/user:)\s*(?:=|:\s*|\s+)\s*[^\s]+' ) {
+        $m = [regex]::Match($CommandLine, '(?i)(?:^|\s)-p\s*(?:=|\s+)\s*(?:"(?<secret>[^"]+)"|''(?<secret>[^'']+)''|(?<secret>[^\s"]+))')
+        if ($m.Success) {
+            $secret = $m.Groups['secret'].Value.Trim().TrimEnd(',', ';')
+            if (-not (Test-FalsePositive -Value $secret)) {
+                return ,([pscustomobject]@{ Label = 'short_password_argument'; Secret = $secret })
+            }
+        }
+    }
+
+    return @()
+}
+
 # ============================================================================
 #  USER-CUSTOMIZABLE PATTERN LISTS
 #
@@ -2787,6 +2826,91 @@ function Test-AppSessionArtifacts {
     }
 }
 
+function Test-WindowsServices {
+    Write-Info "Stage 1.31 - Windows service accounts / hardcoded command-line credentials"
+    $root = 'HKLM:\SYSTEM\CurrentControlSet\Services'
+    if (-not (Test-Path $root)) { return }
+    Add-Checked -Label 'windows_services' -Path $root
+
+    try {
+        Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
+            $serviceName = $_.PSChildName
+            $servicePath = "$root\$serviceName"
+            try { $props = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction Stop } catch { return }
+
+            $account = ''
+            if ($props.PSObject.Properties.Match('ObjectName').Count -gt 0) {
+                $account = "$($props.ObjectName)".Trim()
+            }
+            $imagePath = ''
+            if ($props.PSObject.Properties.Match('ImagePath').Count -gt 0) {
+                $imagePath = "$($props.ImagePath)".Trim()
+            }
+
+            # Built-in and virtual service identities are expected. A local,
+            # domain, gMSA, or other custom account is valuable context even
+            # though SCM's corresponding password is protected by LSA.
+            if ($account -and $account -notmatch '(?i)^(LocalSystem|\.\\LocalSystem|NT AUTHORITY\\(?:LocalService|NetworkService)|NT SERVICE\\.+)$') {
+                $detail = "service[$serviceName] account=$account"
+                if ($imagePath) { $detail += " ImagePath=$imagePath" }
+                Add-Interesting -Category 'windows_service_account' -Path $detail
+            }
+
+            if ($imagePath) {
+                foreach ($hit in @(Get-ServiceCommandCredential -CommandLine $imagePath)) {
+                    $preview = "service[$serviceName]"
+                    if ($account) { $preview += " account=$account" }
+                    $preview += " ImagePath=$imagePath"
+                    Add-Finding -Bucket High -Label "windows_service/imagepath_$($hit.Label)" `
+                        -Path $servicePath -LineNumber 0 -Preview $preview
+                }
+            }
+
+            # Third-party services frequently keep wrapper arguments or their
+            # own configuration beneath a Parameters subkey. Inspect its string
+            # values as well as explicitly password-named values, without ever
+            # modifying or invoking the service.
+            $valueSets = @(@{ Path = $servicePath; Properties = $props })
+            $parametersPath = "$servicePath\Parameters"
+            if (Test-Path -LiteralPath $parametersPath) {
+                try {
+                    $parameterProps = Get-ItemProperty -LiteralPath $parametersPath -ErrorAction Stop
+                    $valueSets += @{ Path = $parametersPath; Properties = $parameterProps }
+                } catch {}
+            }
+
+            $reported = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($set in $valueSets) {
+                foreach ($prop in $set.Properties.PSObject.Properties) {
+                    if ($prop.Name -like 'PS*' -or $prop.Name -in @('ImagePath','ObjectName')) { continue }
+                    if ($prop.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($prop.Value)) { continue }
+                    $value = "$($prop.Value)".Trim()
+
+                    if ($prop.Name -match '(?i)(?:password|passwd|passphrase|pwd|secret)$' -and
+                        -not (Test-FalsePositive -Value $value)) {
+                        $signature = "$($set.Path)|$($prop.Name)|literal"
+                        if ($reported.Add($signature)) {
+                            Add-Finding -Bucket High -Label 'windows_service/registry_secret_value' `
+                                -Path $set.Path -LineNumber 0 `
+                                -Preview ("service[{0}] {1}={2}" -f $serviceName, $prop.Name, $value)
+                        }
+                        continue
+                    }
+
+                    foreach ($hit in @(Get-ServiceCommandCredential -CommandLine $value)) {
+                        $signature = "$($set.Path)|$($prop.Name)|$($hit.Label)"
+                        if ($reported.Add($signature)) {
+                            Add-Finding -Bucket High -Label "windows_service/registry_$($hit.Label)" `
+                                -Path $set.Path -LineNumber 0 `
+                                -Preview ("service[{0}] {1}={2}" -f $serviceName, $prop.Name, $value)
+                        }
+                    }
+                }
+            }
+        }
+    } catch {}
+}
+
 function Invoke-SystemChecks {
     $script:InStage1 = $true
     Invoke-Stage1Check { Test-RegistryAutoLogon }
@@ -2819,6 +2943,7 @@ function Invoke-SystemChecks {
     Invoke-Stage1Check { Test-AppServers }
     Invoke-Stage1Check { Test-DotNetUserSecrets }
     Invoke-Stage1Check { Test-AppSessionArtifacts }
+    Invoke-Stage1Check { Test-WindowsServices }
     $script:InStage1 = $false
 }
 

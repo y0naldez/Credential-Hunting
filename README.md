@@ -22,7 +22,7 @@ Two siblings, one behavior: `credshunter.sh` for Linux and `credshunter.ps1` for
 A staged funnel narrows from known credential locations to suspicious files and content-level matches. The tool does not authenticate, spray, dump processes, exploit services, change files, or touch the network.
 
 ```text
- Stage 1   OS and user artifacts      registry, histories, vaults, sessions, shortcuts, workspaces
+ Stage 1   OS and user artifacts      registry, services, histories, vaults, sessions, shortcuts, workspaces
  Stage 2   Credential containers      kdbx, ppk, pfx, keytab, axx, enc, gpg, renamed archives
  Stage 3   High-value file types      keys, env files, backups, DBs, captures, configs
  Stage 4   Suspicious filenames       password, secret, credential, backup, vault
@@ -37,7 +37,7 @@ CredsHunter focuses on local, reusable, or investigation-worthy credential mater
 
 | Category | Examples |
 |---|---|
-| Direct credentials | `password=...`, connection strings, basic auth URLs, WinRM/Impacket commands, PHP arrays, PHP `define()`, DB connect calls |
+| Direct credentials | `password=...`, connection strings, basic auth URLs, Windows service command lines, WinRM/Impacket commands, PHP arrays, PHP `define()`, DB connect calls |
 | Private keys and auth material | SSH keys, PuTTY keys, PFX/P12, keytabs, SAM/SYSTEM hives, GPP `cpassword` |
 | Credential containers | KeePass `.kdbx`, encrypted archives, `.axx`, `.enc`, `.gpg`, `.pgp`, renamed ZIP/7z/RAR/GZip/TAR files |
 | Encrypted credential leads | Ansible Vault, SOPS encrypted values, Kubernetes SealedSecret, Kubernetes `encryptedData` |
@@ -45,6 +45,8 @@ CredsHunter focuses on local, reusable, or investigation-worthy credential mater
 | Interesting files | `.env`, backups, configs, database dumps, captures, likely credential filenames |
 
 Cloud and SaaS API token hunting is intentionally limited to reduce noise. Local cloud CLI credential files may still be listed as interesting artifacts.
+
+On Windows, Stage 1 enumerates service `ImagePath`, `ObjectName`, and string values in each service's `Parameters` subkey. Literal passwords in command-line arguments, URLs, or password-named registry values are reported as `[HIGH]`; services running under non-built-in accounts are listed for review. Passwords managed normally by the Service Control Manager are stored as protected LSA secrets, so the tool does not attempt to extract them.
 
 ## Usage
 
