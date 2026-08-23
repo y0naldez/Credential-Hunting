@@ -302,16 +302,17 @@ $script:RawPatterns = @(
     @{ Label = 'password_assign';
        # JSON session files store line/tab boundaries as literal \n / \t.
        # Treat those escapes as boundaries so "\tPassword: value" is not
-       # misread as the identifier "tPassword" and silently skipped.
-       Regex = '(?im)(^|\\[nrt]|[^A-Za-z_])(password|passwd|passphrase|pwd)["'']?\s*[:=]\s*["'']?[^\s"#<>{}]{3,}' }
+       # misread as the identifier "tPassword" and silently skipped. An
+       # escaped JSON quote (\") may be part of the password, not its delimiter.
+       Regex = '(?im)(^|\\[nrt]|[^A-Za-z_])(password|passwd|passphrase|pwd)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s"#<>{}]){3,}' }
 
     # ---- DB / service-prefixed passwords ------------------------------------
     @{ Label = 'db_password';
-       Regex = '(?im)(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|cifs)[_-]?(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?[^\s"#<>{}]{3,}' }
+       Regex = '(?im)(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|cifs)[_-]?(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s"#<>{}]){3,}' }
     # Any identifier ending in _password/_pass/_pwd (OpenStack keystone_password,
     # nova_password, app_password, mail_pass, ...). Value FP filter prunes refs.
     @{ Label = 'prefixed_password';
-       Regex = '(?im)[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?[^\s"#<>{}]{3,}' }
+       Regex = '(?im)[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s"#<>{}]){3,}' }
 
     # ---- Connection-string passwords (.NET / JDBC / ODBC) -------------------
     @{ Label = 'connection_string';
@@ -1415,8 +1416,19 @@ function Format-SessionCredentialPreview {
     param([string]$MatchText)
     # Remove leading JSON control escapes and stop at the next escaped logical
     # line so an entire Sublime buffer is not mistaken for the credential.
-    $fragment = $MatchText -replace '^(?:\\[nrt])+', ''
-    $fragment = ($fragment -split '\\[nrt]', 2)[0]
+    # Accept one or more backslashes: depending on the serialization layer the
+    # same logical newline may appear as \n or \\n. Consuming the full separator
+    # prevents a stray trailing backslash from looking like part of the secret.
+    $fragment = $MatchText -replace '^(?:\\+[nrt])+', ''
+    $fragment = ($fragment -split '\\+[nrt]', 2)[0]
+    # Decode exactly one JSON-string layer when this is a fragment from an
+    # escaped editor buffer. Thus \" becomes " while \\\" correctly remains
+    # a literal backslash followed by a quote in the real password. Structured
+    # JSON key/value fragments contain unescaped quotes and simply use fallback.
+    try {
+        $decoded = ConvertFrom-Json -InputObject ('"' + $fragment + '"') -ErrorAction Stop
+        if ($decoded -is [string]) { $fragment = $decoded }
+    } catch {}
     $fragment = Format-Preview $fragment
     if ($fragment.Length -gt 512) { $fragment = $fragment.Substring(0, 512) + $script:GEll }
     return $fragment + ' | REVIEW ENTIRE SESSION FILE; additional useful information or credentials may be present.'

@@ -503,15 +503,15 @@ parse_args() {
 CRED_PATTERNS=(
     # ── Direct password assignments ──────────────────────────────────────
     # Literal JSON \n / \r / \t escapes are credential-key boundaries too.
-    'password_assign|(^|\\[nrt]|[^A-Za-z_])(password|passwd|passphrase|pwd)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
+    'password_assign|(^|\\[nrt]|[^A-Za-z_])(password|passwd|passphrase|pwd)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?([\\]+"|[^[:space:]"#$<>{}]){3,}'
 
     # ── DB / service-prefixed passwords ──────────────────────────────────
-    'db_password|(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|sftp|cifs)[_-]?(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
+    'db_password|(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|sftp|cifs)[_-]?(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?([\\]+"|[^[:space:]"#$<>{}]){3,}'
     # Any OTHER identifier ending in _password/_pass/_pwd (covers OpenStack
     # keystone_password, nova_password, app_password, mail_pass, ...). The
     # value FP filter removes references/placeholders. Placed AFTER db_password
     # so the well-known prefixes keep their specific label.
-    'prefixed_password|[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
+    'prefixed_password|[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?([\\]+"|[^[:space:]"#$<>{}]){3,}'
 
     # ── Connection-string passwords (SQL Server / .NET / JDBC / generic) ─
     # Allow arbitrary content (incl. semicolons) between the server= clause
@@ -944,6 +944,35 @@ sanitize() {
     printf '%s' "$v"
 }
 
+# Session/workspace formats can serialize logical line separators as \n or as
+# \\n after an additional encoding layer. Show only the credential-bearing
+# fragment, consume the complete separator (so no stray '\' looks like part of
+# the password), and direct the operator to review the complete artifact.
+session_credential_preview() {
+    local fragment decoded="" i=0 c next len
+    fragment=$(printf '%s' "$1" | sed -E 's/^([\\]+[nrt])+//; s/[\\]+[nrt].*$//')
+    # Decode exactly one JSON-string layer. This turns \" into " but preserves
+    # a real backslash+quote password represented as \\\" in serialized JSON.
+    len=${#fragment}
+    while [ "$i" -lt "$len" ]; do
+        c="${fragment:i:1}"
+        if [ "$c" = '\' ] && [ $((i + 1)) -lt "$len" ]; then
+            next="${fragment:i+1:1}"
+            case "$next" in
+                '"'|'\'|'/') decoded+="$next"; i=$((i + 2)); continue ;;
+            esac
+        fi
+        decoded+="$c"
+        i=$((i + 1))
+    done
+    fragment="$decoded"
+    fragment=$(sanitize "$fragment")
+    if [ "${#fragment}" -gt 512 ]; then
+        fragment="${fragment:0:512}${GELL}"
+    fi
+    printf '%s | REVIEW ENTIRE SESSION FILE; additional useful information or credentials may be present.' "$fragment"
+}
+
 # Cap a preview for the LIVE feed only (never the Findings section / log). Real
 # credentials are far shorter than the cap, so this only trims pathological
 # multi-KB lines; the complete value still appears in Findings.
@@ -1125,6 +1154,21 @@ reference_carrier_name() {
         *.sublime_session|*.sublime-workspace|*.sublime-project|*.code-workspace) return 0 ;;
         consolehost_history.txt|*_history|.*_history|.viminfo|recently-used.xbel|*.desktop|*.url|*.rdp) return 0 ;;
         session.xml|shortcuts.xml) return 0 ;;
+    esac
+    return 1
+}
+
+app_session_artifact() {
+    local file="$1" source_label="$2" bn="${1##*/}" lower
+    lower="${bn,,}"
+    case "${source_label,,}" in
+        *app_session*|*workspace*|*sublime*|*vscode*) return 0 ;;
+    esac
+    case "$lower" in
+        *.sublime_session|*.sublime-workspace|*.sublime-project|*.code-workspace|session.xml|shortcuts.xml) return 0 ;;
+    esac
+    case "$file" in
+        */.config/Code/User/globalStorage/storage.json|*/.config/Code/User/workspaceStorage/*.json) return 0 ;;
     esac
     return 1
 }
@@ -1358,11 +1402,13 @@ classify_line() {
     [[ "$content" == *SQLTelemetry*Setting* ]] && return 1
     [[ "$content" == *SafeSqlCommand*PASSWORD*\*\*\*\*\*\*\** ]] && return 1
 
-    local entry label regex value
+    local entry label regex value matched_text preview
     for entry in "${CRED_PATTERNS[@]}"; do
         label="${entry%%|*}"
         regex="${entry#*|}"
         if [[ "$content" =~ $regex ]]; then
+            # Save this immediately: later regex helpers overwrite BASH_REMATCH.
+            matched_text="${BASH_REMATCH[0]}"
             encrypted_secret_value_line "$content" && return 1
             # ── Commented example skip ───────────────────────────────────
             # Stock configs ship docs like `# snmpwalk -c public` or
@@ -1427,7 +1473,12 @@ classify_line() {
                     is_false_positive "$value" && return 1
                     ;;
             esac
-            record_finding HIGH "${source_label}/${label}" "$file" "$lineno" "$(sanitize "$content")"
+            if app_session_artifact "$file" "$source_label"; then
+                preview=$(session_credential_preview "$matched_text")
+            else
+                preview=$(sanitize "$content")
+            fi
+            record_finding HIGH "${source_label}/${label}" "$file" "$lineno" "$preview"
             return 0
         fi
     done
@@ -1457,6 +1508,12 @@ scan_file() {
     SCANNED_PATHS["$key"]=1
 
     [ -f "$file" ] || return
+
+    # A session/workspace is itself a review lead, even if it later proves
+    # unreadable or contains no credential pattern.
+    if app_session_artifact "$file" "$source_label"; then
+        record_interest "USER_ARTIFACT/app_session" "$file"
+    fi
 
     # Fast filename skip — runs before any I/O so well-known cred-free
     # files (LICENSE, package-lock.json, .gitignore, etc.) cost nothing.
@@ -1885,7 +1942,6 @@ check_app_session_artifacts() {
     info "Stage 1.13 -- editor/session artifacts (Sublime / VS Code / desktop recent files)"
     local f kind
     while IFS= read -r -d '' f; do
-        record_interest "USER_ARTIFACT/app_session" "$f"
         scan_file "$f" "app_session"
     done < <(find /root /home -maxdepth 8 -type f \( \
         -name '*.sublime_session' \
