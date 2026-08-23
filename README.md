@@ -17,6 +17,8 @@
 
 Two siblings, one behavior: `credshunter.sh` for Linux and `credshunter.ps1` for Windows.
 
+Documentation: **English (this file)** | [Español](Docs/README.es.md)
+
 ## How It Works
 
 A staged funnel narrows from known credential locations to suspicious files and content-level matches. The tool does not authenticate, spray, dump processes, exploit services, change files, or touch the network.
@@ -29,7 +31,7 @@ A staged funnel narrows from known credential locations to suspicious files and 
  Stage 5   Content scan               tuned regexes for reusable credentials and encrypted leads
 ```
 
-The newer reference-led checks also inspect files that commonly reveal where credentials live, such as shell histories, PowerShell history, VS Code workspaces, Sublime sessions, recent shortcuts, and similar user artifacts.
+Reference-led checks also inspect files that commonly reveal where credentials live, such as command histories, saved editor/application state, workspaces, recent shortcuts, and similar user artifacts. Session files remain review leads even when the first match is only one password: the same artifact may contain additional targets, identities, commands, paths, or credentials.
 
 ## What It Finds
 
@@ -38,15 +40,31 @@ CredsHunter focuses on local, reusable, or investigation-worthy credential mater
 | Category | Examples |
 |---|---|
 | Direct credentials | `password=...`, connection strings, basic auth URLs, Windows service command lines, WinRM/Impacket commands, PHP arrays, PHP `define()`, DB connect calls |
+| Windows service findings | Hardcoded credentials in service `ImagePath`, command-line arguments, URLs, or string values under `Parameters`; non-built-in service accounts are retained as review leads |
 | Private keys and auth material | SSH keys, PuTTY keys, PFX/P12, keytabs, SAM/SYSTEM hives, GPP `cpassword` |
 | Credential containers | KeePass `.kdbx`, encrypted archives, `.axx`, `.enc`, `.gpg`, `.pgp`, renamed ZIP/7z/RAR/GZip/TAR files |
-| Encrypted credential leads | Ansible Vault, SOPS encrypted values, Kubernetes SealedSecret, Kubernetes `encryptedData` |
+| Encrypted credential leads | Vault-formatted encrypted blocks, structured encrypted values, and sealed or application-managed secret data |
 | Reference leads | Paths found in histories, recent files, shortcuts, editor sessions, and workspace files |
+| User-artifact leads | Saved editor/application state that warrants complete review |
 | Interesting files | `.env`, backups, configs, database dumps, captures, likely credential filenames |
 
 Cloud and SaaS API token hunting is intentionally limited to reduce noise. Local cloud CLI credential files may still be listed as interesting artifacts.
 
 On Windows, Stage 1 enumerates service `ImagePath`, `ObjectName`, and string values in each service's `Parameters` subkey. Literal passwords in command-line arguments, URLs, or password-named registry values are reported as `[HIGH]`; services running under non-built-in accounts are listed for review. Passwords managed normally by the Service Control Manager are stored as protected LSA secrets, so the tool does not attempt to extract them.
+
+## Saved Application State and Review Leads
+
+Saved editor and application state can contain unsaved notes, remote targets, usernames, commands, paths, and multiple credentials. Both engines recognize common serialized session, workspace, settings, shortcut, and application-state artifacts without requiring the operator to know every product-specific location in advance.
+
+Known session files are retained as `USER_ARTIFACT/app_session` leads. A reusable password produces a focused preview plus an explicit full-file review notice:
+
+```text
+[HIGH] app_session/password_assign  <session-file>: line <N>
+       Password: <detected-value> | REVIEW ENTIRE SESSION FILE; additional useful information or credentials may be present.
+[LEAD] USER_ARTIFACT/app_session  <session-file>
+```
+
+The credential is the trigger for the `[HIGH]` finding, while the path and line identify where it was found. The accompanying lead tells the operator to review the complete artifact because other useful targets, identities, commands, paths, or credentials may be stored elsewhere in the same session.
 
 ## Usage
 
@@ -115,24 +133,37 @@ Counts
 
 `-o` / `-OutputFile` still works with clean mode, so you can keep a file for later review while keeping the terminal readable.
 
+The output log can contain plaintext secrets. Treat it as sensitive assessment data, restrict access to it, and remove it securely when it is no longer needed.
+
 Use `--no-color` / `-NoColor` when redirecting output, pasting results into reports, running in limited terminals, or processing with tools like `grep`, `findstr`, or `Select-String`.
 
 ## Output Tags
 
-Findings are grouped by severity and type:
+`CRITICAL`, `HIGH`, and `KEY` are directly actionable findings. Leads are investigation directions, not proof that a reusable credential was recovered.
 
-| Tag | Meaning |
-|---|---|
-| `[CRITICAL]` | Confirmed credential container or highly sensitive credential artifact |
-| `[HIGH]` | Reusable password, hash, connection string, GPP cpassword, command-line credential |
-| `[KEY]` | Private key or readable auth material such as SAM/SYSTEM hives |
-| `[ENCRYPTED_CREDENTIAL_LEAD]` | Encrypted secret block that needs a password/key to decrypt |
-| `[CREDENTIAL_LEAD]` | Artifact likely to contain or point to credential material |
-| `[REFERENCE]` | Path reference found in user artifacts, histories, editor sessions, or shortcuts |
-| `[INTEREST]` | High-value file worth reviewing |
-| `[NAME]` | Suspicious filename review hint |
+| Tag or category | Meaning | Recommended action |
+|---|---|---|
+| `[CRITICAL]` | Confirmed credential container or highly sensitive credential artifact | Secure and inspect the complete container |
+| `[HIGH]` | Reusable password, hash, connection string, GPP `cpassword`, or command-line credential | Validate only within scope and review its source |
+| `[KEY]` | Private key or readable auth material such as SAM/SYSTEM hives | Protect it and identify the related identity/system |
+| `ENCRYPTED_CREDENTIAL_LEAD` | Encrypted secret that needs a key, password, or product-specific decryptor | Identify the format and companion key/configuration |
+| `CREDENTIAL_LEAD` | Artifact likely to contain or point to credential material | Inspect the artifact and nearby configuration |
+| `REFERENCE` | Path found in a history, session, workspace, recent file, or shortcut | Follow the referenced path |
+| `USER_ARTIFACT/app_session` | Saved application/editor session with possible additional targets, commands, identities, or credentials | Review the entire file, not only the matched line |
+| `[INTEREST]` | High-value file worth reviewing but not a confirmed credential | Triage manually using its category and path |
+| `[NAME]` | Suspicious filename review hint | Review it; a name alone is not proof |
+| `[CHECK]` | Targeted location was checked | Informational only |
+| `[SKIP]` | Content scan omitted the file because of size, binary detection, readability, or noise rules | Adjust scope/options only if the file matters |
 
-The exit code is `1` whenever anything lands in `CRITICAL`, `HIGH`, or `KEY`; otherwise it exits `0`.
+In clean mode, `ENCRYPTED_CREDENTIAL_LEAD`, `CREDENTIAL_LEAD`, `REFERENCE`, and `USER_ARTIFACT/...` appear under the visual tag `[LEAD]`:
+
+```text
+[LEAD] CREDENTIAL_LEAD/referenced_file  /path/to/config
+[LEAD] REFERENCE  history -> /path/to/config
+[LEAD] USER_ARTIFACT/app_session  <session-file>
+```
+
+Exit codes: `0` means no `CRITICAL`/`HIGH`/`KEY`; `1` means at least one actionable finding; `2` means an argument, I/O, or fatal error; and `130` means interrupted. Leads, interests, and name hints alone do not change `0` to `1`.
 
 ## Tuning
 
@@ -144,10 +175,10 @@ The exit code is `1` whenever anything lands in `CRITICAL`, `HIGH`, or `KEY`; ot
 | Disable colors | `--no-color` | `-NoColor` |
 | Save output | `-o loot.txt` | `-OutputFile .\loot.txt` |
 | Scan every file | `-a` / `--all` | `-All` |
-| Change size cap | `-m N` / `--max-file-size-mb N` | `-MaxFileSizeMB N` |
+| Change size cap | `-m N` / `--max-size N` | `-MaxFileSizeMB N` |
 | Disable size cap | `--no-size-limit` | `-NoSizeLimit` |
 | Skip a stage | `--no-stageN` | `-NoStageN` |
-| Include SQL/CSV dumps | default set plus options | `-IncludeData` |
+| Include SQL/CSV and other non-default data | `--all` | `-IncludeData` |
 
 Patterns and file-type lists live in clearly labeled arrays near the top of each script.
 
@@ -160,7 +191,15 @@ No. It is read-only, writes only to the output file you choose, never touches th
 Full disk scans walk a lot of files and Stage 5 reads file content. In CTFs and labs, scans are usually faster because the target paths are smaller. For speed, scan likely locations first: `/home`, `/var/www`, `/opt`, `C:\Users`, `C:\inetpub`, app folders, backup folders, and web roots.
 
 **What does an encrypted credential lead mean?**  
-It means CredsHunter found something that probably contains a secret, but the value is encrypted. Examples include Ansible Vault, SOPS, and SealedSecret data. The report shows the file and marker so you know where to focus next.
+It means CredsHunter found something that probably contains a secret, but the value is encrypted or sealed. This includes vault-formatted blocks, structured encrypted values, and application-managed secret data. The report shows the file and marker so you know where to focus next.
+
+**What does `REVIEW ENTIRE SESSION FILE` mean?**
+
+The displayed password is only the trigger. Saved application state may contain more hosts, identities, commands, paths, notes, and credentials. Review the complete source file shown in the finding.
+
+**Why can `USER_ARTIFACT/app_session` appear without a `[HIGH]` match?**
+
+Session state is useful evidence on its own and may contain unsaved content or references that generic password patterns cannot classify safely.
 
 **Why use clean mode?**  
 Clean mode is better for quick triage and reports. Default mode is better when you want to watch each stage and see every raw finding as it appears.
