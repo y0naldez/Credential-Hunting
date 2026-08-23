@@ -300,7 +300,10 @@ $script:SubstageFindings = 0
 $script:RawPatterns = @(
     # ---- Direct password assignments ---------------------------------------
     @{ Label = 'password_assign';
-       Regex = '(?im)(^|[^A-Za-z_])(password|passwd|passphrase|pwd)["'']?\s*[:=]\s*["'']?[^\s"#<>{}]{3,}' }
+       # JSON session files store line/tab boundaries as literal \n / \t.
+       # Treat those escapes as boundaries so "\tPassword: value" is not
+       # misread as the identifier "tPassword" and silently skipped.
+       Regex = '(?im)(^|\\[nrt]|[^A-Za-z_])(password|passwd|passphrase|pwd)["'']?\s*[:=]\s*["'']?[^\s"#<>{}]{3,}' }
 
     # ---- DB / service-prefixed passwords ------------------------------------
     @{ Label = 'db_password';
@@ -607,11 +610,11 @@ $script:FalsePositives = @(
     'test','tester','testing',
     'foo','bar','baz','qux','foobar','barbaz',
     'abc','123',
-    # NOTE: weak/common passwords (qwerty, letmein, password123, p@ssw0rd,
-    # 123456, admin123, test123, ...) are DELIBERATELY *not* dropped here --
+    # NOTE: weak/common/default passwords (qwerty, letmein, changeme,
+    # password123, p@ssw0rd, 123456, admin123, test123, ...) are DELIBERATELY
+    # *not* dropped here --
     # on CTF/HTB boxes and real weak-credential findings those ARE the answer,
     # so suppressing them would lose valid findings.
-    'changeme','change_me','change-me','changethis','change-this','changeit','change-it',
     'todo','fixme','tbd','n/a','na',
     'your_password','yourpassword','your-password','yourpasswordhere','yourpwd',
     'insert_password','replace_me','replace-me','replace_this','insert_here',
@@ -644,9 +647,8 @@ function Test-FalsePositive { param([string]$Value)
     if ($lower -match '(placeholder|placeholders)$')                          { return $true }
     if ($lower -match '_(example|sample|dummy|mock|stub|fake|demo)$')         { return $true }
 
-    # High-confidence placeholder phrases ANYWHERE in the value (substring) --
-    # these appear only in templates/examples, never in a real password.
-    if ($lower -match 'changeme|change_me|change-me|changethis|change_this') { return $true }
+    # Do not filter changeme/change-this strings, either exact or embedded:
+    # weak/default passwords commonly use them and remain directly usable.
     if ($lower -match 'yourpassword|your_password|your-password|passwordhere|password_here|goeshere') { return $true }
     if ($lower -match 'placeholder|redacted|replaceme|replace_me|replacethis|replace_this') { return $true }
     if ($lower -match 'insertpassword|insert_password|enterpassword|enter_password|enteryour') { return $true }
@@ -1405,6 +1407,21 @@ function Format-Preview { param([string]$Text)
     return $t.Trim()
 }
 
+# Session/workspace files can contain much more than the fields surrounding one
+# password: additional targets, commands, paths, usernames, and credentials.
+# Show only the credential-bearing fragment that triggered the finding, then
+# explicitly direct the operator to review the complete artifact.
+function Format-SessionCredentialPreview {
+    param([string]$MatchText)
+    # Remove leading JSON control escapes and stop at the next escaped logical
+    # line so an entire Sublime buffer is not mistaken for the credential.
+    $fragment = $MatchText -replace '^(?:\\[nrt])+', ''
+    $fragment = ($fragment -split '\\[nrt]', 2)[0]
+    $fragment = Format-Preview $fragment
+    if ($fragment.Length -gt 512) { $fragment = $fragment.Substring(0, 512) + $script:GEll }
+    return $fragment + ' | REVIEW ENTIRE SESSION FILE; additional useful information or credentials may be present.'
+}
+
 # Cap a preview for the LIVE feed only (never the Findings section / log). Real
 # credentials are far shorter than the cap, so this only trims pathological
 # multi-KB lines; the complete value still appears in the Findings section.
@@ -1652,6 +1669,16 @@ function Test-ReferenceCarrierName {
     )
 }
 
+function Test-AppSessionArtifact {
+    param([string]$FullPath, [string]$SourceLabel)
+    $n = [System.IO.Path]::GetFileName($FullPath).ToLowerInvariant()
+    if ($SourceLabel -match '(?i)app_session|workspace|sublime|vscode') { return $true }
+    if ($n -like '*.sublime_session' -or $n -like '*.sublime-workspace' -or
+        $n -like '*.sublime-project' -or $n -like '*.code-workspace' -or
+        $n -eq 'session.xml' -or $n -eq 'shortcuts.xml') { return $true }
+    return ($FullPath -match '(?i)\\AppData\\Roaming\\(?:Code|Code - Insiders)\\User\\(?:globalStorage\\storage|settings)\.json$')
+}
+
 function Get-ReferenceCandidates {
     param([string]$Content)
     $refs = [System.Collections.Generic.List[string]]::new()
@@ -1863,6 +1890,12 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
     Invoke-EncryptedSecretLeadDetection -FullPath $FullPath -Content $content
     Invoke-DecryptableConfigLeadDetection -FullPath $FullPath -Content $content -SourceLabel $SourceLabel
 
+    $isAppSession = Test-AppSessionArtifact -FullPath $FullPath -SourceLabel $SourceLabel
+    if ($isAppSession) {
+        # Always leave a review lead, even if no credential pattern matches or
+        # the host/user fields live outside the password line.
+        Add-Interesting -Category 'USER_ARTIFACT/app_session' -Path $FullPath
+    }
     if (Test-ReferenceCarrierName -Name $bn -SourceLabel $SourceLabel) {
         Invoke-ReferenceExtraction -FullPath $FullPath -Content $content -Application $SourceLabel
     }
@@ -1957,7 +1990,7 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             # substring inside "bypass" / "compass" / "passenger".
             $value = $line
             $kwMatch = [regex]::Match($line,
-                '(?i)(?<![A-Za-z])(?:cpassword|passphrase|password|passwd|requirepass|rootpw|credentials?|cred|secret|pass|pwd)\s*[:=]?\s*',
+                '(?i)(?:(?<![A-Za-z])|(?<=\\[nrt]))(?:cpassword|passphrase|password|passwd|requirepass|rootpw|credentials?|cred|secret|pass|pwd)\s*[:=]?\s*',
                 [System.Text.RegularExpressions.RegexOptions]::None)
             if ($kwMatch.Success) {
                 $value = $line.Substring($kwMatch.Index + $kwMatch.Length)
@@ -2006,8 +2039,13 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
                 if (Test-FalsePositive -Value $value) { break }
             }
 
+            $findingPreview = if ($isAppSession) {
+                Format-SessionCredentialPreview -MatchText $m.Value
+            } else {
+                Format-Preview $line
+            }
             Add-Finding -Bucket High -Label "$SourceLabel/$($p.Label)" `
-                -Path $FullPath -LineNumber $i -Preview (Format-Preview $line)
+                -Path $FullPath -LineNumber $i -Preview $findingPreview
             $matchesFound++
             break    # one classification per line is enough
         }

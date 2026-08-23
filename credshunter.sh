@@ -502,7 +502,8 @@ parse_args() {
 
 CRED_PATTERNS=(
     # ── Direct password assignments ──────────────────────────────────────
-    'password_assign|(^|[^A-Za-z_])(password|passwd|passphrase|pwd)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
+    # Literal JSON \n / \r / \t escapes are credential-key boundaries too.
+    'password_assign|(^|\\[nrt]|[^A-Za-z_])(password|passwd|passphrase|pwd)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
 
     # ── DB / service-prefixed passwords ──────────────────────────────────
     'db_password|(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|sftp|cifs)[_-]?(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?[^[:space:]"#$<>{}]{3,}'
@@ -695,12 +696,12 @@ FALSE_POSITIVE_EXACT=(
     test tester testing
     foo bar baz qux foobar barbaz
     abc 123
-    # NOTE: weak/common passwords (qwerty, letmein, password123, p@ssw0rd,
-    # 123456, admin123, test123, ...) are DELIBERATELY *not* dropped here.
+    # NOTE: weak/common/default passwords (qwerty, letmein, changeme,
+    # password123, p@ssw0rd, 123456, admin123, test123, ...) are DELIBERATELY
+    # *not* dropped here.
     # On CTF/HTB boxes and real weak-credential findings those ARE the answer,
     # so suppressing them would lose valid findings. Only unambiguous
     # template/echo/masked values stay on this list.
-    changeme change_me change-me changethis change-this changeit change-it
     todo fixme tbd "n/a" na
     your_password yourpassword your-password yourpasswordhere yourpwd
     insert_password replace_me replace-me replace_this insert_here
@@ -748,10 +749,9 @@ is_false_positive() {
     esac
 
     # ── High-confidence placeholder phrases anywhere in the value ─────────
-    # These appear ONLY in templates/examples — never inside a real password
-    # — so substring matching is safe and does not lose valid findings.
+    # Do not filter changeme/change-this strings, either exact or embedded:
+    # weak/default passwords commonly use them and remain directly usable.
     case "$lower" in
-        *changeme*|*change_me*|*change-me*|*changethis*|*change_this*) return 0 ;;
         *yourpassword*|*your_password*|*your-password*|*passwordhere*|*password_here*|*goeshere*) return 0 ;;
         *placeholder*|*redacted*|*replaceme*|*replace_me*|*replacethis*|*replace_this*) return 0 ;;
         *insertpassword*|*insert_password*|*enterpassword*|*enter_password*|*enteryour*) return 0 ;;
