@@ -460,6 +460,31 @@ parse_args() {
         # leave harvested secrets world/group readable in a shared directory.
         ( umask 077; : >"$OUTPUT_FILE" ) || { err "Cannot write to $OUTPUT_FILE"; exit 2; }
         chmod 600 "$OUTPUT_FILE" 2>/dev/null || true
+
+        # Never scan the report we are producing.  Keep the user-facing value
+        # untouched (so messages still show e.g. "loot.txt"), but add both its
+        # lexical absolute path and canonical path to find's prune list.
+        # is_internal_scan_file() below is an inode-based fallback for relative
+        # scan roots such as `-p .`, whose find output may be `./loot.txt`.
+        local output_abs output_canon
+        case "$OUTPUT_FILE" in
+            /*) output_abs="$OUTPUT_FILE" ;;
+            *)  output_abs="$(pwd)/$OUTPUT_FILE" ;;
+        esac
+        # Preserve relative spellings too: find keeps the spelling of its scan
+        # root (`-p .` yields `./loot.txt`, while `-p subdir` yields
+        # `subdir/loot.txt`).  These entries keep the report out of candidate
+        # enumeration instead of merely discarding it at scan time.
+        EXCLUDE_PATHS+=("$OUTPUT_FILE")
+        case "$OUTPUT_FILE" in
+            /*|./*) ;;
+            *) EXCLUDE_PATHS+=("./$OUTPUT_FILE") ;;
+        esac
+        EXCLUDE_PATHS+=("$output_abs")
+        output_canon=$(readlink -f -- "$OUTPUT_FILE" 2>/dev/null || true)
+        if [ -n "$output_canon" ] && [ "$output_canon" != "$output_abs" ]; then
+            EXCLUDE_PATHS+=("$output_canon")
+        fi
     fi
     # Must be a positive integer (>= 1). `-m 0` would make `find -size -0c`
     # and the Stage-1 size gate exclude every file, silently scanning nothing.
@@ -1401,6 +1426,11 @@ classify_line() {
     # SQL Server Telemetry / Setup-Bootstrap log noise
     [[ "$content" == *SQLTelemetry*Setting* ]] && return 1
     [[ "$content" == *SafeSqlCommand*PASSWORD*\*\*\*\*\*\*\** ]] && return 1
+    # /etc/nsswitch.conf uses `passwd: files systemd` to select account
+    # databases.  It is routing syntax, not a password assignment.
+    if [ "${file##*/}" = "nsswitch.conf" ] && [[ "$content" =~ ^[[:space:]]*passwd:[[:space:]] ]]; then
+        return 1
+    fi
 
     local entry label regex value matched_text preview
     for entry in "${CRED_PATTERNS[@]}"; do
@@ -1410,6 +1440,17 @@ classify_line() {
             # Save this immediately: later regex helpers overwrite BASH_REMATCH.
             matched_text="${BASH_REMATCH[0]}"
             encrypted_secret_value_line "$content" && return 1
+            # NOPASSWD is actionable only when it comes from an active sudoers
+            # policy.  Broad scans also encounter cloud-init templates such as
+            # /etc/cloud/cloud.cfg; those are not themselves enforced policy.
+            if [ "$label" = "sudoers_nopasswd" ] && [ "$source_label" != "sudoers" ]; then
+                local sudoers_path
+                sudoers_path=$(readlink -f -- "$file" 2>/dev/null || printf '%s' "$file")
+                case "$sudoers_path" in
+                    /etc/sudoers|/etc/sudoers.d/*) ;;
+                    *) return 1 ;;
+                esac
+            fi
             # ── Commented example skip ───────────────────────────────────
             # Stock configs ship docs like `# snmpwalk -c public` or
             # `# rocommunity public` — examples, not live creds. Skip comment
@@ -2064,11 +2105,30 @@ build_find_excludes() {
     for d in "${EXCLUDE_DIR_NAMES[@]}"; do
         inner+=( -o -type d -name "$d" )
     done
+    # The scanner writes findings into a uniquely named temporary directory.
+    # Prune that exact directory name even when the scan root is relative (for
+    # example `cd /tmp && credshunter -p .`), where an absolute -path rule would
+    # not match find's `./...` output.
+    inner+=( -o -type d -name "${TMPDIR##*/}" )
     for d in "${EXCLUDE_PATHS[@]}"; do
         inner+=( -o -path "$d" -o -path "$d/*" )
     done
     # Drop the leading "-o" (inner[@]:1) and wrap in a ( ... ) -prune -o group.
     [ "${#inner[@]}" -gt 0 ] && FIND_EXCLUDE_ARGS=( '(' "${inner[@]:1}" ')' -prune -o )
+}
+
+# Defence in depth for paths whose spelling differs from find's prune rules.
+# Bash's -ef compares the underlying file identity, so ./loot.txt and an
+# absolute/canonical OUTPUT_FILE are treated as the same file.
+is_internal_scan_file() {
+    local file="$1"
+    case "$file" in
+        "$TMPDIR"|"$TMPDIR"/*) return 0 ;;
+    esac
+    if [ -n "$OUTPUT_FILE" ] && [ "$file" -ef "$OUTPUT_FILE" ] 2>/dev/null; then
+        return 0
+    fi
+    return 1
 }
 
 # Stage 2 — confirmed credential containers
@@ -2083,6 +2143,7 @@ find_guaranteed_credentials() {
         [ -e "$path" ] || continue
         while IFS= read -r -d '' f; do
             [ -z "$f" ] && continue
+            is_internal_scan_file "$f" && continue
             local ext_only="${f##*.}"
             record_guaranteed "${ext_only,,}" "$f"
         done < <(find "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${name_expr[@]}" -print0 2>/dev/null)
@@ -2125,6 +2186,7 @@ find_high_value_files() {
         [ -e "$path" ] || continue
         while IFS= read -r -d '' f; do
             [ -z "$f" ] && continue
+            is_internal_scan_file "$f" && continue
             # Stage 2 dedup -- skip files already flagged as guaranteed
             [ -n "${STAGE2_HITS[$f]:-}" ] && continue
             # SKIP_DB_BASENAMES filter (MS SQL Server templates)
@@ -2144,6 +2206,7 @@ find_high_value_files() {
 
         while IFS= read -r -d '' f; do
             [ -z "$f" ] && continue
+            is_internal_scan_file "$f" && continue
             local bn ext kind
             bn="${f##*/}"
             ext="${bn##*.}"
@@ -2193,6 +2256,7 @@ find_suspicious_filenames() {
         [ -e "$path" ] || continue
         while IFS= read -r -d '' f; do
             [ -z "$f" ] && continue
+            is_internal_scan_file "$f" && continue
             # Skip files already flagged as confirmed containers in Stage 2
             [ -n "${STAGE2_HITS[$f]:-}" ] && continue
             local bn="${f##*/}"
@@ -2277,6 +2341,7 @@ scan_user_paths_contents() {
     local current=0
     while IFS= read -r -d '' f; do
         [ -z "$f" ] && continue
+        is_internal_scan_file "$f" && continue
         current=$((current + 1))
         draw_progress "$current" "$total" "Scanning"
         scan_file "$f" "content"
@@ -2411,7 +2476,9 @@ print_summary() {
 }
 
 clean_line() {
-    printf '%b\n' "$*"
+    # Color variables already contain real ESC bytes.  %s is deliberate: %b
+    # would interpret backslash sequences found inside credential previews.
+    printf '%s\n' "$*"
     log_line "$*"
 }
 
@@ -2424,14 +2491,17 @@ print_clean_tsv_findings() {
     local title="$1" file="$2" tag="$3" color="$4" limit="${5:-25}"
     [ -s "$file" ] || return 0
     clean_section "$title"
-    sort -u "$file" | awk -F'\t' -v tag="$tag" -v limit="$limit" -v color="$color" -v nc="$NC" -v dim="$D" '
+    local rendered
+    while IFS= read -r rendered || [ -n "$rendered" ]; do
+        clean_line "$rendered"
+    done < <(sort -u "$file" | awk -F'\t' -v tag="$tag" -v limit="$limit" -v color="$color" -v nc="$NC" -v dim="$D" '
         NR <= limit {
             printf "  %s[%s]%s %s  %s%s: line %s%s\n", color, tag, nc, $1, dim, $2, $3, nc
             if ($4 != "") printf "         %s%s%s\n", dim, $4, nc
         }
         END {
             if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc
-        }'
+        }')
 }
 
 print_clean_interest_filter() {
@@ -2441,9 +2511,12 @@ print_clean_interest_filter() {
     awk -F'\t' -v pat="$pattern" '$1 ~ pat { print }' "$INTEREST_FILE" | sort -u >"$tmp"
     [ -s "$tmp" ] || { rm -f "$tmp"; return 0; }
     clean_section "$title"
-    awk -F'\t' -v tag="$tag" -v limit="$limit" -v color="$color" -v nc="$NC" -v dim="$D" '
+    local rendered
+    while IFS= read -r rendered || [ -n "$rendered" ]; do
+        clean_line "$rendered"
+    done < <(awk -F'\t' -v tag="$tag" -v limit="$limit" -v color="$color" -v nc="$NC" -v dim="$D" '
         NR <= limit { printf "  %s[%s]%s %s  %s\n", color, tag, nc, $1, $2 }
-        END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }' "$tmp"
+        END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }' "$tmp")
     rm -f "$tmp"
 }
 
@@ -2454,9 +2527,12 @@ print_clean_other_interest() {
         sort -u >"$tmp"
     [ -s "$tmp" ] || { rm -f "$tmp"; return 0; }
     clean_section "Other interesting files"
-    awk -F'\t' -v limit=10 -v color="$C" -v nc="$NC" -v dim="$D" '
+    local rendered
+    while IFS= read -r rendered || [ -n "$rendered" ]; do
+        clean_line "$rendered"
+    done < <(awk -F'\t' -v limit=10 -v color="$C" -v nc="$NC" -v dim="$D" '
         NR <= limit { printf "  %s[INTEREST]%s %s  %s\n", color, nc, $1, $2 }
-        END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }' "$tmp"
+        END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }' "$tmp")
     rm -f "$tmp"
 }
 
@@ -2475,9 +2551,12 @@ print_clean_summary() {
 
     if [ -s "$GUARANTEED_FILE" ]; then
         clean_section "Credential containers"
-        sort -u "$GUARANTEED_FILE" | awk -F'\t' -v limit=25 -v color="$R" -v nc="$NC" -v dim="$D" '
+        local rendered
+        while IFS= read -r rendered || [ -n "$rendered" ]; do
+            clean_line "$rendered"
+        done < <(sort -u "$GUARANTEED_FILE" | awk -F'\t' -v limit=25 -v color="$R" -v nc="$NC" -v dim="$D" '
             NR <= limit { printf "  %s[CRITICAL]%s %-8s %s\n", color, nc, $1, $2 }
-            END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }'
+            END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }')
     fi
 
     print_clean_tsv_findings "Private keys and auth material" "$KEY_FILE" "KEY" "$M" 25
