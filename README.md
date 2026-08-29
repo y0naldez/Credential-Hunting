@@ -132,15 +132,14 @@ Counts
 ```
 
 Clean mode is a prioritized triage view. It promotes private keys ahead of
-password matches and suppresses commented source examples plus findings
-originating in installed dependency source/package caches (for example Ruby
-gems, `node_modules`, and Python site-packages). `NOISE_SUPPRESSED` reports how
-many raw items were omitted from that view. Full mode retains those raw matches
-for exhaustive review.
+password matches and suppresses commented examples, package documentation, and
+installed dependency artifacts (for example Ruby gems, `.jar` files,
+`node_modules`, and Python site-packages). `NOISE_SUPPRESSED` reports how many
+raw items were omitted from that view. Full mode retains those raw matches for
+exhaustive review.
 
-All remaining entries under `Other interesting files` are shown in clean mode;
-that section is not truncated because its tail may contain a backup, database,
-packet capture, or archive that needs manual inspection.
+Every remaining entry is shown in clean mode. No findings or leads are hidden
+behind a display limit.
 
 Private-key detection is content-based: an extensionless file such as
 `~/.ssh/keys/root` is reported as `[KEY]` when it contains a real private-key

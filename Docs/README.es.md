@@ -92,16 +92,14 @@ En modo limpio, las categorías de pistas aparecen bajo el tag visual `[LEAD]`:
 Prioriza `[CRITICAL]`, `[HIGH]` y `[KEY]`; después revisa sesiones completas, sigue `REFERENCE`/`CREDENTIAL_LEAD` e identifica el mecanismo requerido por cada `ENCRYPTED_CREDENTIAL_LEAD`.
 
 En modo limpio, las llaves privadas aparecen antes que las coincidencias de
-password. La vista también omite ejemplos comentados y ruido procedente del
-código y cachés de dependencias instaladas (por ejemplo Ruby gems,
+password. La vista también omite ejemplos comentados, documentación de paquetes
+y dependencias instaladas (por ejemplo Ruby gems, archivos `.jar`,
 `node_modules` y Python site-packages); `NOISE_SUPPRESSED` indica cuántos
 elementos crudos se ocultaron. El modo completo conserva esas coincidencias
 para una revisión exhaustiva.
 
-Todas las entradas restantes de `Other interesting files` se muestran en modo
-limpio. Esa sección no se trunca porque al final podría existir un respaldo,
-una base de datos, una captura de red o un archivo comprimido que requiera
-revisión manual.
+El modo limpio muestra todas las entradas restantes. Ningún hallazgo o pista se
+oculta detrás de un límite de presentación.
 
 La detección de llaves se basa en el contenido, no sólo en el nombre: un archivo
 sin extensión como `~/.ssh/keys/root` se clasifica como `[KEY]` si contiene una

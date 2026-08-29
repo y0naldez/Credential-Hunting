@@ -184,12 +184,7 @@ if ([string]::IsNullOrEmpty($script:SelfPath)) {
 # ----------------------------------------------------------------------------
 $script:MaxFileSizeBytes  = $MaxFileSizeMB * 1MB
 $script:SkipLarge         = -not $NoSizeLimit.IsPresent
-$script:MaxMatchesPerFile = 20
-# Findings output is NEVER truncated -- the full matched secret is always shown
-# in the grouped Findings section and written to the -OutputFile log. The live
-# per-stage feed caps each preview at MaxLivePreviewLen purely so a pathological
-# multi-KB minified / base64 / log line cannot flood the console; any real
-# credential is far shorter and shown whole. Mirrored in the bash engine.
+# Keep stage previews bounded; summaries retain full values.
 $script:MaxLivePreviewLen = 2000
 # Longest line scanned per file. 16 KB covers single-line GPP Groups.xml /
 # one-line JSON connection strings while bounding .NET regex backtracking on
@@ -635,7 +630,7 @@ $script:FalsePositives = @(
 
 function Test-FalsePositive { param([string]$Value)
     if ($null -eq $Value) { return $true }
-    $v = $Value.Trim().Trim('"', "'", ' ', ';')
+    $v = $Value.Trim().Trim('"', "'", ' ', ';', ',', ')')
     $len = $v.Length
     if ($len -lt 3 -or $len -gt 256) { return $true }
 
@@ -667,6 +662,7 @@ function Test-FalsePositive { param([string]$Value)
     if ($lower -match 'configurationmanager|boto3|ssm\.get|getparameter')        { return $true }
     # Bare dotted identifier reference (config.dbPassword, settings.password).
     if ($v -match '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$')         { return $true }
+    if ($v -match '^[A-Za-z_][A-Za-z0-9_]*\[[^\]]+\]$')                         { return $true }
     # Function-call accessor (getPassword(), get_password(), cfg.getSecret()) --
     # code that fetches a secret at runtime, not a hardcoded literal.
     if ($v -match '^[A-Za-z_][A-Za-z0-9_.]*\(.*\)$')                             { return $true }
@@ -1969,7 +1965,6 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
     if (-not $script:KeywordPrefilter.IsMatch($content)) { return }
 
     # ---- Line-by-line credential-pattern scan -------------------------------
-    $matchesFound = 0
     # Stream lines with a StringReader instead of -split, which would allocate the
     # whole file as a string[] -- doubling memory and GC pressure on exactly the
     # large files that are slowest. $i is 1-based (incremented before use), so
@@ -1980,7 +1975,6 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
         $i = 0
         while ($null -ne ($line = $reader.ReadLine())) {
             $i++
-            if ($matchesFound -ge $script:MaxMatchesPerFile) { break }
             $llen = $line.Length
             if ($llen -lt 6 -or $llen -gt $script:MaxLineLen) { continue }
 
@@ -2076,7 +2070,6 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             }
             Add-Finding -Bucket High -Label "$SourceLabel/$($p.Label)" `
                 -Path $FullPath -LineNumber $i -Preview $findingPreview
-            $matchesFound++
             break    # one classification per line is enough
         }
         }
@@ -3335,20 +3328,13 @@ function Write-CleanFindings {
     param(
         [string]$Title,
         [object[]]$Items,
-        [int]$Limit = 25,
         [scriptblock]$Renderer
     )
     if (-not $Items -or $Items.Count -eq 0) { return }
     Write-CleanLine ""
     Write-CleanLine "$($script:CBold)$($script:CW)$Title$($script:CNC)"
-    $shown = 0
-    foreach ($item in ($Items | Select-Object -First $Limit)) {
-        $shown++
+    foreach ($item in $Items) {
         & $Renderer $item
-    }
-    $remaining = $Items.Count - $shown
-    if ($remaining -gt 0) {
-        Write-CleanLine ("  $($script:CD)... {0} more hidden in clean view$($script:CNC)" -f $remaining)
     }
 }
 
@@ -3360,6 +3346,9 @@ function Test-CleanNoisePath {
         $p -match '/var/lib/gems/[0-9.]+/gems/' -or
         $p -match '/usr/(local/)?lib/ruby/gems/' -or
         $p -match '/vendor/bundle/' -or
+        $p -match '/usr/share/doc/' -or
+        $p -match '[.]jar($|[:( ])' -or
+        $p -match '/usr/share/[^/]+/lib/.*[.](zip|whl)($|[:( ])' -or
         $p -match '/credshunter[.](sh|ps1)(:|$)') { return $true }
     if ($IncludePackageCaches -and (
         $p -match '/var/lib/gems/[0-9.]+/cache/' -or
@@ -3370,13 +3359,10 @@ function Test-CleanNoisePath {
 
 function Test-CleanNoiseFinding { param([object]$Finding)
     if (Test-CleanNoisePath -Path $Finding.Path) { return $true }
-    $p = $Finding.Path.Replace('\','/').ToLowerInvariant()
-    $sourceFile = $p -match '[.](rb|py|pl|php|js|ts|java|cs|go|rs|c|cc|cpp|h|hpp|ps1|sh|bash)$'
-    return ($sourceFile -and $Finding.Preview -match '^\s*(#|//|;|REM\s)')
+    return ($Finding.Preview -match '^\s*(#|//|;|REM\s|<!--)')
 }
 
 function Write-CleanSummary {
-    $top = 25
     Write-Section "Clean findings summary"
     Write-LogLine ""
     Write-LogLine "=== Clean findings summary ==="
@@ -3391,7 +3377,7 @@ function Write-CleanSummary {
         Sort-Object Path, Label, LineNumber |
         Group-Object Path |
         ForEach-Object { $_.Group | Select-Object -First 1 })
-    Write-CleanFindings -Title "Private keys and auth material" -Items $keys -Limit $top -Renderer {
+    Write-CleanFindings -Title "Private keys and auth material" -Items $keys -Renderer {
         param($f)
         $location = if ($f.LineNumber -gt 0) { "{0}: line {1}" -f $f.Path, $f.LineNumber } else { $f.Path }
         Write-CleanLine ("  $($script:CM)[KEY]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $f.Label, $location)
@@ -3399,12 +3385,12 @@ function Write-CleanSummary {
     }
 
     $containers = @($script:Guaranteed | Sort-Object Extension, Path)
-    Write-CleanFindings -Title "Credential containers" -Items $containers -Limit $top -Renderer {
+    Write-CleanFindings -Title "Credential containers" -Items $containers -Renderer {
         param($g)
         Write-CleanLine ("  $($script:CR)[CRITICAL]$($script:CNC) {0,-8} {1}" -f $g.Extension, $g.Path)
     }
 
-    Write-CleanFindings -Title "Directly usable credentials" -Items $high -Limit $top -Renderer {
+    Write-CleanFindings -Title "Directly usable credentials" -Items $high -Renderer {
         param($f)
         $location = if ($f.LineNumber -gt 0) { "{0}: line {1}" -f $f.Path, $f.LineNumber } else { $f.Path }
         Write-CleanLine ("  $($script:CR)[HIGH]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $f.Label, $location)
@@ -3415,7 +3401,7 @@ function Write-CleanSummary {
         -not (Test-CleanNoisePath -Path $_.Path -IncludePackageCaches)
     })
     $encrypted = @($cleanInteresting | Where-Object { $_.Category -like 'ENCRYPTED_CREDENTIAL_LEAD*' } | Sort-Object Category, Path)
-    Write-CleanFindings -Title "Encrypted credential leads" -Items $encrypted -Limit $top -Renderer {
+    Write-CleanFindings -Title "Encrypted credential leads" -Items $encrypted -Renderer {
         param($i)
         Write-CleanLine ("  $($script:CC)[LEAD]$($script:CNC) {0}  {1}" -f $i.Category, $i.Path)
     }
@@ -3425,7 +3411,7 @@ function Write-CleanSummary {
         $cat = $_.Category
         ($leadCats | Where-Object { $cat -like $_ }).Count -gt 0 -and $cat -notlike 'ENCRYPTED_CREDENTIAL_LEAD*'
     } | Sort-Object Category, Path)
-    Write-CleanFindings -Title "References and user-artifact leads" -Items $leads -Limit $top -Renderer {
+    Write-CleanFindings -Title "References and user-artifact leads" -Items $leads -Renderer {
         param($i)
         Write-CleanLine ("  $($script:CY)[LEAD]$($script:CNC) {0}  {1}" -f $i.Category, $i.Path)
     }
@@ -3437,7 +3423,7 @@ function Write-CleanSummary {
         $_.Category -notlike 'USER_ARTIFACT*'
     } | Sort-Object Category, Path)
 
-    Write-CleanFindings -Title "Other interesting files" -Items $other -Limit $other.Count -Renderer {
+    Write-CleanFindings -Title "Other interesting files" -Items $other -Renderer {
         param($i)
         Write-CleanLine ("  $($script:CC)[INTEREST]$($script:CNC) {0}  {1}" -f $i.Category, $i.Path)
     }

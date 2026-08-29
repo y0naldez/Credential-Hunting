@@ -61,24 +61,13 @@ NO_COLOR_FLAG=0
 SCAN_PATHS=()
 USER_EXCLUDE_PATHS=()
 OUTPUT_FILE=""
-MAX_MATCHES_PER_FILE=20
-# Findings output is NEVER truncated -- the full matched secret is always shown
-# in the grouped Findings section and written to the -o log. The live per-stage
-# feed caps each preview at LIVE_PREVIEW_LEN purely so a pathological multi-KB
-# minified / base64 / log line cannot flood the terminal; any real credential is
-# far shorter and shown whole, and the complete value is always in Findings.
+# Keep stage previews bounded; summaries retain full values.
 LIVE_PREVIEW_LEN=2000
 # Longest line classify_line will inspect. Real credential lines are short; a
 # multi-KB minified/base64/log line would otherwise pin the per-pattern regex
 # loop. 16 KB comfortably covers single-line GPP Groups.xml / one-line JSON
 # connection strings while bounding worst-case CPU. Mirrored in the PS engine.
 MAX_LINE_LEN=16384
-# Upper bound on regex-matching lines fed to classify_line per file. The real
-# finding cap is MAX_MATCHES_PER_FILE (post-FP); this only bounds pathological
-# files where thousands of lines match the prefilter but are all false
-# positives, so a genuine credential after them is still reached and reported.
-PREFILTER_LINE_CAP=5000
-
 # Stage-1 live-output state. When IN_STAGE1=1, the record_* helpers stream
 # each finding to stderr as it's discovered so the operator sees results in
 # real time. SUBSTAGE_FINDINGS is reset before each substage runs; if it is
@@ -749,8 +738,12 @@ FALSE_POSITIVE_EXACT=(
 
 is_false_positive() {
     local v="$1"
-    # Trim leading/trailing whitespace, surrounding quotes
+    # Trim syntax around an extracted value.
     v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    while [[ "$v" == *',' || "$v" == *')' ]]; do
+        v="${v%?}"
+    done
     v="${v%"${v##*[![:space:]]}"}"
     v="${v#\"}"; v="${v%\"}"
     v="${v#\'}"; v="${v%\'}"
@@ -800,6 +793,7 @@ is_false_positive() {
     # ── Bare dotted identifier reference (config.dbPassword, settings.pass) ─
     # A code reference, not a literal. ($-prefixed form handled further down.)
     [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$ ]] && return 0
+    [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*\[[^]]+\]$ ]] && return 0
 
     # ── Function-call accessor (getPassword(), get_password(), cfg.getSecret())
     # — code that FETCHES a secret at runtime, not a hardcoded literal.
@@ -1504,10 +1498,9 @@ classify_line() {
                 value="${BASH_REMATCH[3]}"
                 value="${value%%#*}"
                 value="${value%%;*}"
-                # Cut at ", " / " -> " / "  message=" — common log noise
-                value="${value%%, message*}"
+                # Stop at the next field.
+                value="${value%%, *}"
                 value="${value%% -> *}"
-                value="${value%%, source*}"
             fi
             # PHP 'key' => 'value' / define('KEY','value') shapes: the generic
             # extractor above leaves a messy "=> 'value'" prefix, so take the
@@ -1630,16 +1623,12 @@ scan_file() {
     # ── Phase 2: combined credential alternation ─────────────────────────
     # One grep call selects all candidate lines. Classification happens
     # in-bash via [[ =~ ]] with no subprocess fork per pattern.
-    local matches_found=0
     while IFS= read -r match || [ -n "$match" ]; do
         [ -z "$match" ] && continue
-        [ "$matches_found" -ge "$MAX_MATCHES_PER_FILE" ] && break
         local lineno="${match%%:*}"
         local content="${match#*:}"
-        if classify_line "$content" "$file" "$lineno" "$source_label"; then
-            matches_found=$((matches_found + 1))
-        fi
-    done < <(grep -niE -m "$PREFILTER_LINE_CAP" -- "$COMBINED_CRED_REGEX" "$file" 2>/dev/null)
+        classify_line "$content" "$file" "$lineno" "$source_label" || true
+    done < <(grep -niE -- "$COMBINED_CRED_REGEX" "$file" 2>/dev/null)
 
     # ── Phase 3: multi-line XML credential tags (unattend.xml / sysprep) ──
     # Real autologon blocks split <Password> and <Value> across lines, which
@@ -2526,24 +2515,21 @@ clean_section() {
 }
 
 print_clean_tsv_findings() {
-    local title="$1" file="$2" tag="$3" color="$4" limit="${5:-25}"
+    local title="$1" file="$2" tag="$3" color="$4"
     [ -s "$file" ] || return 0
     clean_section "$title"
     local rendered
     while IFS= read -r rendered || [ -n "$rendered" ]; do
         clean_line "$rendered"
-    done < <(sort -u "$file" | awk -F'\t' -v tag="$tag" -v limit="$limit" -v color="$color" -v nc="$NC" -v dim="$D" '
-        NR <= limit {
+    done < <(sort -u "$file" | awk -F'\t' -v tag="$tag" -v color="$color" -v nc="$NC" -v dim="$D" '
+        {
             printf "  %s[%s]%s %s  %s%s: line %s%s\n", color, tag, nc, $1, dim, $2, $3, nc
             if ($4 != "") printf "         %s%s%s\n", dim, $4, nc
-        }
-        END {
-            if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc
         }')
 }
 
 print_clean_interest_filter() {
-    local title="$1" pattern="$2" tag="$3" color="$4" limit="${5:-25}"
+    local title="$1" pattern="$2" tag="$3" color="$4"
     [ -s "$INTEREST_FILE" ] || return 0
     local tmp="$TMPDIR/clean-interest.$$"
     awk -F'\t' -v pat="$pattern" '$1 ~ pat { print }' "$INTEREST_FILE" | sort -u >"$tmp"
@@ -2552,9 +2538,8 @@ print_clean_interest_filter() {
     local rendered
     while IFS= read -r rendered || [ -n "$rendered" ]; do
         clean_line "$rendered"
-    done < <(awk -F'\t' -v tag="$tag" -v limit="$limit" -v color="$color" -v nc="$NC" -v dim="$D" '
-        NR <= limit { printf "  %s[%s]%s %s  %s\n", color, tag, nc, $1, $2 }
-        END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }' "$tmp")
+    done < <(awk -F'\t' -v tag="$tag" -v color="$color" -v nc="$NC" '
+        { printf "  %s[%s]%s %s  %s\n", color, tag, nc, $1, $2 }' "$tmp")
     rm -f "$tmp"
 }
 
@@ -2589,13 +2574,15 @@ prepare_clean_high() {
     awk -F'\t' '
         function noisy(p, preview, q, src) {
             q=tolower(p)
-            src = q ~ /[.](rb|py|pl|php|js|ts|java|cs|go|rs|c|cc|cpp|h|hpp|ps1|sh|bash)$/
             return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
                    q ~ /\/var\/lib\/gems\/[0-9.]+\/gems\// ||
                    q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                    q ~ /\/vendor\/bundle\// ||
+                   q ~ /\/usr\/share\/doc\// ||
+                   q ~ /[.]jar$/ ||
+                   q ~ /\/usr\/share\/[^/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)$/ ||
-                   (src && preview ~ /^[[:space:]]*(#|\/\/|;|REM[[:space:]])/)
+                   preview ~ /^[[:space:]]*(#|\/\/|;|REM[[:space:]]|<!--)/
         }
         !noisy($2, $4) { print }
     ' "$HIGH_FILE" | sort -u >"$out"
@@ -2620,6 +2607,9 @@ prepare_clean_interest() {
                    q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|cache)\// ||
                    q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                    q ~ /\/vendor\/bundle\// ||
+                   q ~ /\/usr\/share\/doc\// ||
+                   q ~ /[.]jar$/ ||
+                   q ~ /\/usr\/share\/[^/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)(:|$)/ ||
                    q ~ /^\/etc\/apt\/trusted[.]gpg([.]d\/|$)/ ||
                    q ~ /^\/usr\/share\/keyrings\//
@@ -2640,24 +2630,23 @@ print_clean_summary() {
 
     # Authentication material comes first so a long password list cannot bury
     # an extensionless private key such as ~/.ssh/keys/root.
-    print_clean_tsv_findings "Private keys and auth material" "$clean_keys" "KEY" "$M" 25
+    print_clean_tsv_findings "Private keys and auth material" "$clean_keys" "KEY" "$M"
 
     if [ -s "$GUARANTEED_FILE" ]; then
         clean_section "Credential containers"
         local rendered
         while IFS= read -r rendered || [ -n "$rendered" ]; do
             clean_line "$rendered"
-        done < <(sort -u "$GUARANTEED_FILE" | awk -F'\t' -v limit=25 -v color="$R" -v nc="$NC" -v dim="$D" '
-            NR <= limit { printf "  %s[CRITICAL]%s %-8s %s\n", color, nc, $1, $2 }
-            END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }')
+        done < <(sort -u "$GUARANTEED_FILE" | awk -F'\t' -v color="$R" -v nc="$NC" '
+            { printf "  %s[CRITICAL]%s %-8s %s\n", color, nc, $1, $2 }')
     fi
 
-    print_clean_tsv_findings "Directly usable credentials" "$clean_high" "HIGH" "$R" 25
+    print_clean_tsv_findings "Directly usable credentials" "$clean_high" "HIGH" "$R"
 
     local original_interest="$INTEREST_FILE"
     INTEREST_FILE="$clean_interest"
-    print_clean_interest_filter "Encrypted credential leads" '^ENCRYPTED_CREDENTIAL_LEAD' "LEAD" "$C" 25
-    print_clean_interest_filter "References and user-artifact leads" '^(CREDENTIAL_LEAD|REFERENCE|USER_ARTIFACT)' "LEAD" "$Y" 25
+    print_clean_interest_filter "Encrypted credential leads" '^ENCRYPTED_CREDENTIAL_LEAD' "LEAD" "$C"
+    print_clean_interest_filter "References and user-artifact leads" '^(CREDENTIAL_LEAD|REFERENCE|USER_ARTIFACT)' "LEAD" "$Y"
     print_clean_other_interest
     INTEREST_FILE="$original_interest"
 
