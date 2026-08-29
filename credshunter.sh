@@ -2634,11 +2634,38 @@ prepare_clean_high() {
                    q ~ /[.]jar$/ ||
                    q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)$/ ||
-                   r ~ /^[[:space:]]*<!--/ ||
-                   r ~ /^[[:space:]]*(#|\/\/|;|rem[[:space:]]+)[[:space:]]*[a-z][a-z0-9_.-]*(password|passwd|passphrase|pwd|pass)[[:space:]]*[:=]/ ||
+                   r ~ /^[[:space:]]*(#|;|[/][/]|--([[:space:]]|$)|rem([[:space:]]|$)|<!--|[/][*])/ ||
                    r ~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/
         }
         !noisy($2, $4) { print }
+    ' "$HIGH_FILE" | sort -u >"$out"
+}
+
+prepare_clean_commented() {
+    local out="$1"
+    [ -s "$HIGH_FILE" ] || { : >"$out"; return; }
+    awk -F'\t' 'BEGIN { OFS="\t" }
+        function noisy_path(q) {
+            return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
+                   q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|extensions)\// ||
+                   q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
+                   q ~ /\/vendor\/bundle\// ||
+                   q ~ /\/usr\/share\/doc\// ||
+                   q ~ /[.]jar$/ ||
+                   q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
+                   q ~ /\/credshunter[.](sh|ps1)$/
+        }
+        function commented(r) {
+            return r ~ /^[[:space:]]*(#|;|[/][/]|--([[:space:]]|$)|rem([[:space:]]|$)|<!--|[/][*])/
+        }
+        {
+            q=tolower($2); r=tolower($4)
+            if (!noisy_path(q) && commented(r) && r !~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/) {
+                sub(/^[^/]+\//, "", $1)
+                $1="commented/" $1
+                print
+            }
+        }
     ' "$HIGH_FILE" | sort -u >"$out"
 }
 
@@ -2679,7 +2706,7 @@ prepare_clean_interest() {
             if (cat != "high_value_file") return 0
             if (q ~ /[.](sh|bash|crt|cer|csr|log)$/ ||
                 q ~ /\/etc\/(console-setup|init[.]d|profile[.]d)\// ||
-                q ~ /\/var\/backups\/(alternatives|apt[.]extended_states|dpkg[.](diversions|statoverride|status))[.][0-9]+[.]gz$/ ||
+                q ~ /\/var\/backups\/(alternatives([.]tar)?|apt[.]extended_states|dpkg[.](diversions|statoverride|status))[.][0-9]+[.]gz$/ ||
                 q ~ /\/var\/lib\/cassandra\/saved_caches\//) return 1
             if (q ~ /\/var\/lib\/cassandra\/data\// &&
                 q !~ /\/system_auth\/roles-[^\/]+\/[^\/]+-data[.]db$/) return 1
@@ -2694,8 +2721,10 @@ print_clean_summary() {
     log_line ""
     log_line "=== Clean findings summary ==="
 
-    local clean_high="$TMPDIR/clean-high.tsv" clean_keys="$TMPDIR/clean-keys.tsv" clean_interest="$TMPDIR/clean-interest.tsv"
+    local clean_high="$TMPDIR/clean-high.tsv" clean_commented="$TMPDIR/clean-commented.tsv"
+    local clean_keys="$TMPDIR/clean-keys.tsv" clean_interest="$TMPDIR/clean-interest.tsv"
     prepare_clean_high "$clean_high"
+    prepare_clean_commented "$clean_commented"
     prepare_clean_keys "$clean_keys"
     prepare_clean_interest "$clean_interest"
 
@@ -2713,6 +2742,7 @@ print_clean_summary() {
     fi
 
     print_clean_tsv_findings "Directly usable credentials" "$clean_high" "HIGH" "$R" 1
+    print_clean_tsv_findings "Commented or historical credential leads" "$clean_commented" "LEAD" "$Y" 1
 
     local original_interest="$INTEREST_FILE"
     INTEREST_FILE="$clean_interest"
@@ -2721,9 +2751,10 @@ print_clean_summary() {
     print_clean_other_interest
     INTEREST_FILE="$original_interest"
 
-    local n_guar n_high n_key n_int n_name n_skip n_enc n_leads n_other
+    local n_guar n_high n_commented n_key n_int n_name n_skip n_enc n_leads n_other
     n_guar=$( [ -s "$GUARANTEED_FILE" ] && sort -u "$GUARANTEED_FILE" | wc -l | tr -d ' ' || echo 0)
     n_high=$( [ -s "$clean_high" ] && wc -l <"$clean_high" | tr -d ' ' || echo 0)
+    n_commented=$( [ -s "$clean_commented" ] && wc -l <"$clean_commented" | tr -d ' ' || echo 0)
     n_key=$( [ -s "$clean_keys" ] && wc -l <"$clean_keys" | tr -d ' ' || echo 0)
     n_int=$( [ -s "$clean_interest" ] && wc -l <"$clean_interest" | tr -d ' ' || echo 0)
     n_name=$( [ -s "$NAME_FILE" ] && sort -u "$NAME_FILE" | wc -l | tr -d ' ' || echo 0)
@@ -2734,6 +2765,7 @@ print_clean_summary() {
     INTEREST_FILE="$original_interest"
     n_other=$(( n_int - n_enc - n_leads ))
     [ "$n_other" -lt 0 ] && n_other=0
+    n_leads=$(( n_leads + n_commented ))
 
     clean_line ""
     clean_line "${BOLD}${W}Counts${NC}"
@@ -2741,7 +2773,7 @@ print_clean_summary() {
     raw_high=$( [ -s "$HIGH_FILE" ] && sort -u "$HIGH_FILE" | wc -l | tr -d ' ' || echo 0)
     raw_key=$( [ -s "$KEY_FILE" ] && sort -u "$KEY_FILE" | wc -l | tr -d ' ' || echo 0)
     raw_int=$( [ -s "$INTEREST_FILE" ] && sort -u "$INTEREST_FILE" | wc -l | tr -d ' ' || echo 0)
-    suppressed=$(( raw_high - n_high + raw_key - n_key + raw_int - n_int ))
+    suppressed=$(( raw_high - n_high - n_commented + raw_key - n_key + raw_int - n_int ))
     CLEAN_ACTIONABLE=$(( n_high + n_key + n_guar ))
     clean_line "  HIGH: $n_high  KEY: $n_key  CONTAINERS: $n_guar  ENCRYPTED_LEADS: $n_enc  LEADS: $n_leads  OTHER_INTEREST: $n_other  NOISE_SUPPRESSED: $suppressed  NAME: $n_name  SKIPPED: $n_skip"
 

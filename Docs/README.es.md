@@ -92,8 +92,9 @@ En modo limpio, las categorías de pistas aparecen bajo el tag visual `[LEAD]`:
 Prioriza `[CRITICAL]`, `[HIGH]` y `[KEY]`; después revisa sesiones completas, sigue `REFERENCE`/`CREDENTIAL_LEAD` e identifica el mecanismo requerido por cada `ENCRYPTED_CREDENTIAL_LEAD`.
 
 En modo limpio, las llaves privadas aparecen antes que las coincidencias de
-password. La vista también omite ejemplos comentados, documentación de paquetes
-y dependencias instaladas (por ejemplo Ruby gems, archivos `.jar`,
+password. Las coincidencias completamente comentadas se mueven a una sección
+separada de pistas históricas. La vista omite documentación de paquetes y
+dependencias instaladas (por ejemplo Ruby gems, archivos `.jar`,
 `node_modules` y Python site-packages). También omite coincidencias basadas sólo
 en el nombre para certificados públicos, scripts del sistema, logs rutinarios,
 respaldos del gestor de paquetes y componentes de Cassandra sin datos de

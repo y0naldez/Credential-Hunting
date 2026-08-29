@@ -132,8 +132,9 @@ Counts
 ```
 
 Clean mode is a prioritized triage view. It promotes private keys ahead of
-password matches and suppresses commented examples, package documentation, and
-installed dependency artifacts (for example Ruby gems, `.jar` files,
+password matches and moves fully commented credential matches to a separate
+historical-leads section. It suppresses package documentation and installed
+dependency artifacts (for example Ruby gems, `.jar` files,
 `node_modules`, and Python site-packages). It also omits name-only hits for
 public certificates, system scripts, routine logs, package-manager backups, and
 non-authentication Cassandra components. `NOISE_SUPPRESSED` reports how many raw

@@ -3378,10 +3378,13 @@ function Test-CleanNoisePath {
     return $false
 }
 
+function Test-CleanCommentedFinding { param([object]$Finding)
+    return $Finding.Preview -match '(?i)^\s*(?:#|;|//|--(?:\s|$)|REM(?:\s|$)|<!--|/\*)'
+}
+
 function Test-CleanNoiseFinding { param([object]$Finding)
     if (Test-CleanNoisePath -Path $Finding.Path) { return $true }
-    return ($Finding.Preview -match '^\s*<!--' -or
-            $Finding.Preview -match '(?i)^\s*(#|//|;|REM\s+)\s*[A-Za-z][A-Za-z0-9_.-]*(password|passwd|passphrase|pwd|pass)\s*[:=]' -or
+    return ((Test-CleanCommentedFinding -Finding $Finding) -or
             $Finding.Preview -match '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]')
 }
 
@@ -3391,7 +3394,7 @@ function Test-CleanNoiseInterest { param([object]$Finding)
     $p = $Finding.Path.Replace('\','/').ToLowerInvariant()
     if ($p -match '[.](sh|bash|crt|cer|csr|log)$' -or
         $p -match '/etc/(console-setup|init[.]d|profile[.]d)/' -or
-        $p -match '/var/backups/(alternatives|apt[.]extended_states|dpkg[.](diversions|statoverride|status))[.][0-9]+[.]gz$' -or
+        $p -match '/var/backups/(alternatives(?:[.]tar)?|apt[.]extended_states|dpkg[.](diversions|statoverride|status))[.][0-9]+[.]gz$' -or
         $p -match '/var/lib/cassandra/saved_caches/') { return $true }
     if ($p -match '/var/lib/cassandra/data/' -and
         $p -notmatch '/system_auth/roles-[^/]+/[^/]+-data[.]db$') { return $true }
@@ -3407,6 +3410,26 @@ function Write-CleanSummary {
         -not (Test-CleanNoiseFinding -Finding $_)
     } | Sort-Object Path, LineNumber, Label)
     $highGroups = @($high |
+        Group-Object Label, Path, Preview |
+        ForEach-Object {
+            $first = $_.Group[0]
+            $lines = @($_.Group.LineNumber | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+            [PSCustomObject]@{
+                Label = $first.Label
+                Path = $first.Path
+                Preview = $first.Preview
+                LineNumbers = $lines
+                Occurrences = $_.Group.Count
+                FirstLine = if ($lines.Count -gt 0) { $lines[0] } else { 0 }
+            }
+        } | Sort-Object Path, FirstLine, Label)
+
+    $commented = @($script:HighFindings | Where-Object {
+        (Test-CleanCommentedFinding -Finding $_) -and
+        -not (Test-CleanNoisePath -Path $_.Path) -and
+        $_.Preview -notmatch '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]'
+    } | Sort-Object Path, LineNumber, Label)
+    $commentedGroups = @($commented |
         Group-Object Label, Path, Preview |
         ForEach-Object {
             $first = $_.Group[0]
@@ -3452,6 +3475,18 @@ function Write-CleanSummary {
         if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
     }
 
+    Write-CleanFindings -Title "Commented or historical credential leads" -Items $commentedGroups -Renderer {
+        param($f)
+        $location = if ($f.LineNumbers.Count -eq 1) {
+            "{0}: line {1}" -f $f.Path, $f.LineNumbers[0]
+        } elseif ($f.LineNumbers.Count -gt 1) {
+            "{0}: lines {1} ({2} occurrences)" -f $f.Path, ($f.LineNumbers -join ', '), $f.Occurrences
+        } else { $f.Path }
+        $label = 'commented/' + ($f.Label -replace '^[^/]+/', '')
+        Write-CleanLine ("  $($script:CY)[LEAD]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $label, $location)
+        if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
+    }
+
     $cleanInteresting = @($script:Interesting | Where-Object {
         -not (Test-CleanNoiseInterest -Finding $_)
     })
@@ -3485,13 +3520,13 @@ function Write-CleanSummary {
 
     Write-CleanLine ""
     Write-CleanLine "$($script:CBold)$($script:CW)Counts$($script:CNC)"
-    $suppressed = ($script:HighFindings.Count - $high.Count) +
+    $suppressed = ($script:HighFindings.Count - $high.Count - $commented.Count) +
                   ($script:KeyFindings.Count - $keys.Count) +
                   ($script:Interesting.Count - $cleanInteresting.Count)
     $script:CleanActionableCount = $high.Count + $keys.Count + $script:Guaranteed.Count
     Write-CleanLine ("  HIGH: {0}  KEY: {1}  CONTAINERS: {2}  ENCRYPTED_LEADS: {3}  LEADS: {4}  OTHER_INTEREST: {5}  NOISE_SUPPRESSED: {6}  NAME: {7}  SKIPPED: {8}" -f `
         $high.Count, $keys.Count, $script:Guaranteed.Count,
-        $encrypted.Count, $leads.Count, $other.Count, $suppressed,
+        $encrypted.Count, ($leads.Count + $commented.Count), $other.Count, $suppressed,
         $script:SuspiciousNamesFound.Count, $script:SkippedFiles.Count)
 
     if ($script:LogPath) {
