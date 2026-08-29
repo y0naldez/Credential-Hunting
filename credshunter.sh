@@ -2618,7 +2618,7 @@ prepare_clean_high() {
                    q ~ /\/vendor\/bundle\// ||
                    q ~ /\/usr\/share\/doc\// ||
                    q ~ /[.]jar$/ ||
-                   q ~ /\/usr\/share\/[^/]+\/lib\/.*[.](zip|whl)$/ ||
+                   q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)$/ ||
                    preview ~ /^[[:space:]]*(#|\/\/|;|REM[[:space:]]|<!--)/ ||
                    preview ~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/
@@ -2630,9 +2630,18 @@ prepare_clean_high() {
 prepare_clean_keys() {
     local out="$1"
     [ -s "$KEY_FILE" ] || { : >"$out"; return; }
-    # Stage 1 and content inspection may recognize the same key under different
-    # labels. One path is one actionable key in the clean triage view.
-    sort -t $'\t' -k2,2 -k1,1 "$KEY_FILE" |
+    awk -F'\t' '
+        function noisy(p, q) {
+            q=tolower(p)
+            return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
+                   q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|cache)\// ||
+                   q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
+                   q ~ /\/vendor\/bundle\// ||
+                   q ~ /\/usr\/share\/doc\// ||
+                   q ~ /\/credshunter[.](sh|ps1)(:|$)/
+        }
+        !noisy($2) { print }
+    ' "$KEY_FILE" | sort -t $'\t' -k2,2 -k1,1 |
         awk -F'\t' '!seen[$2]++ { print }' >"$out"
 }
 
@@ -2648,7 +2657,7 @@ prepare_clean_interest() {
                    q ~ /\/vendor\/bundle\// ||
                    q ~ /\/usr\/share\/doc\// ||
                    q ~ /[.]jar$/ ||
-                   q ~ /\/usr\/share\/[^/]+\/lib\/.*[.](zip|whl)$/ ||
+                   q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)(:|$)/ ||
                    q ~ /^\/etc\/apt\/trusted[.]gpg([.]d\/|$)/ ||
                    q ~ /^\/usr\/share\/keyrings\//

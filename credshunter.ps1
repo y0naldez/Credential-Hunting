@@ -3399,6 +3399,7 @@ function Write-CleanSummary {
     # Authentication material comes first so a long password list cannot bury
     # an extensionless private key such as ~/.ssh/keys/root.
     $keys = @($script:KeyFindings |
+        Where-Object { -not (Test-CleanNoisePath -Path $_.Path -IncludePackageCaches) } |
         Sort-Object Path, Label, LineNumber |
         Group-Object Path |
         ForEach-Object { $_.Group | Select-Object -First 1 })
