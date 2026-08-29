@@ -1166,9 +1166,8 @@ detect_artifact_magic() {
         03d9a29a*)                     printf 'keepass_container'; return 0 ;;
         2d2d2d2d2d424547494e20*)       printf 'pem_material'; return 0 ;;
     esac
-    local tar_magic
-    tar_magic=$(dd if="$file" bs=1 skip=257 count=5 2>/dev/null)
-    [ "$tar_magic" = "ustar" ] && { printf 'tar_container'; return 0; }
+
+    [ "${hex:514:10}" = "7573746172" ] && { printf 'tar_container'; return 0; }
     return 1
 }
 
