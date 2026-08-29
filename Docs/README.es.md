@@ -94,9 +94,11 @@ Prioriza `[CRITICAL]`, `[HIGH]` y `[KEY]`; después revisa sesiones completas, s
 En modo limpio, las llaves privadas aparecen antes que las coincidencias de
 password. La vista también omite ejemplos comentados, documentación de paquetes
 y dependencias instaladas (por ejemplo Ruby gems, archivos `.jar`,
-`node_modules` y Python site-packages); `NOISE_SUPPRESSED` indica cuántos
-elementos crudos se ocultaron. El modo completo conserva esas coincidencias
-para una revisión exhaustiva.
+`node_modules` y Python site-packages). También omite coincidencias basadas sólo
+en el nombre para certificados públicos, scripts del sistema, logs rutinarios,
+respaldos del gestor de paquetes y componentes de Cassandra sin datos de
+autenticación. `NOISE_SUPPRESSED` indica cuántos elementos crudos se ocultaron.
+El modo completo los conserva para una revisión exhaustiva.
 
 El modo limpio muestra todas las entradas restantes. Ningún hallazgo o pista se
 oculta detrás de un límite de presentación. Las credenciales idénticas que se

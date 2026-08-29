@@ -134,8 +134,10 @@ Counts
 Clean mode is a prioritized triage view. It promotes private keys ahead of
 password matches and suppresses commented examples, package documentation, and
 installed dependency artifacts (for example Ruby gems, `.jar` files,
-`node_modules`, and Python site-packages). `NOISE_SUPPRESSED` reports how many
-raw items were omitted from that view. Full mode retains those raw matches for
+`node_modules`, and Python site-packages). It also omits name-only hits for
+public certificates, system scripts, routine logs, package-manager backups, and
+non-authentication Cassandra components. `NOISE_SUPPRESSED` reports how many raw
+items were omitted from that view. Full mode retains those raw matches for
 exhaustive review.
 
 Every remaining entry is shown in clean mode. No findings or leads are hidden

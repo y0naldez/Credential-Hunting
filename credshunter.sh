@@ -2610,18 +2610,20 @@ prepare_clean_high() {
     local out="$1"
     [ -s "$HIGH_FILE" ] || { : >"$out"; return; }
     awk -F'\t' '
-        function noisy(p, preview, q, src) {
+        function noisy(p, preview, q, r) {
             q=tolower(p)
+            r=tolower(preview)
             return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
-                   q ~ /\/var\/lib\/gems\/[0-9.]+\/gems\// ||
+                   q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|extensions)\// ||
                    q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                    q ~ /\/vendor\/bundle\// ||
                    q ~ /\/usr\/share\/doc\// ||
                    q ~ /[.]jar$/ ||
                    q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)$/ ||
-                   preview ~ /^[[:space:]]*(#|\/\/|;|REM[[:space:]]|<!--)/ ||
-                   preview ~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/
+                   r ~ /^[[:space:]]*<!--/ ||
+                   r ~ /^[[:space:]]*(#|\/\/|;|rem[[:space:]]+)[[:space:]]*[a-z][a-z0-9_.-]*(password|passwd|passphrase|pwd|pass)[[:space:]]*[:=]/ ||
+                   r ~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/
         }
         !noisy($2, $4) { print }
     ' "$HIGH_FILE" | sort -u >"$out"
@@ -2634,7 +2636,7 @@ prepare_clean_keys() {
         function noisy(p, q) {
             q=tolower(p)
             return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
-                   q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|cache)\// ||
+                   q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|cache|extensions)\// ||
                    q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                    q ~ /\/vendor\/bundle\// ||
                    q ~ /\/usr\/share\/doc\// ||
@@ -2649,20 +2651,28 @@ prepare_clean_interest() {
     local out="$1"
     [ -s "$INTEREST_FILE" ] || { : >"$out"; return; }
     awk -F'\t' '
-        function noisy(p, q) {
+        function noisy(cat, p, q) {
             q=tolower(p)
-            return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
-                   q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|cache)\// ||
-                   q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
-                   q ~ /\/vendor\/bundle\// ||
-                   q ~ /\/usr\/share\/doc\// ||
-                   q ~ /[.]jar$/ ||
-                   q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
-                   q ~ /\/credshunter[.](sh|ps1)(:|$)/ ||
-                   q ~ /^\/etc\/apt\/trusted[.]gpg([.]d\/|$)/ ||
-                   q ~ /^\/usr\/share\/keyrings\//
+            if (q ~ /\/(node_modules|site-packages|dist-packages)\// ||
+                q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|cache|extensions)\// ||
+                q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
+                q ~ /\/vendor\/bundle\// ||
+                q ~ /\/usr\/share\/doc\// ||
+                q ~ /[.]jar$/ ||
+                q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
+                q ~ /\/credshunter[.](sh|ps1)(:|$)/ ||
+                q ~ /^\/etc\/apt\/trusted[.]gpg([.]d\/|$)/ ||
+                q ~ /^\/usr\/share\/keyrings\//) return 1
+            if (cat != "high_value_file") return 0
+            if (q ~ /[.](sh|bash|crt|cer|csr|log)$/ ||
+                q ~ /\/etc\/(console-setup|init[.]d|profile[.]d)\// ||
+                q ~ /\/var\/backups\/(alternatives|apt[.]extended_states|dpkg[.](diversions|statoverride|status))[.][0-9]+[.]gz$/ ||
+                q ~ /\/var\/lib\/cassandra\/saved_caches\//) return 1
+            if (q ~ /\/var\/lib\/cassandra\/data\// &&
+                q !~ /\/system_auth\/roles-[^\/]+\/[^\/]+-data[.]db$/) return 1
+            return 0
         }
-        !noisy($2) { print }
+        !noisy($1, $2) { print }
     ' "$INTEREST_FILE" | sort -u >"$out"
 }
 

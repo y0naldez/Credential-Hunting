@@ -3353,7 +3353,7 @@ function Test-CleanNoisePath {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     $p = $Path.Replace('\','/').ToLowerInvariant()
     if ($p -match '/(node_modules|site-packages|dist-packages)/' -or
-        $p -match '/var/lib/gems/[0-9.]+/gems/' -or
+        $p -match '/var/lib/gems/[0-9.]+/(gems|extensions)/' -or
         $p -match '/usr/(local/)?lib/ruby/gems/' -or
         $p -match '/vendor/bundle/' -or
         $p -match '/usr/share/doc/' -or
@@ -3369,8 +3369,22 @@ function Test-CleanNoisePath {
 
 function Test-CleanNoiseFinding { param([object]$Finding)
     if (Test-CleanNoisePath -Path $Finding.Path) { return $true }
-    return ($Finding.Preview -match '^\s*(#|//|;|REM\s|<!--)' -or
+    return ($Finding.Preview -match '^\s*<!--' -or
+            $Finding.Preview -match '(?i)^\s*(#|//|;|REM\s+)\s*[A-Za-z][A-Za-z0-9_.-]*(password|passwd|passphrase|pwd|pass)\s*[:=]' -or
             $Finding.Preview -match '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]')
+}
+
+function Test-CleanNoiseInterest { param([object]$Finding)
+    if (Test-CleanNoisePath -Path $Finding.Path -IncludePackageCaches) { return $true }
+    if ($Finding.Category -ne 'high_value_file') { return $false }
+    $p = $Finding.Path.Replace('\','/').ToLowerInvariant()
+    if ($p -match '[.](sh|bash|crt|cer|csr|log)$' -or
+        $p -match '/etc/(console-setup|init[.]d|profile[.]d)/' -or
+        $p -match '/var/backups/(alternatives|apt[.]extended_states|dpkg[.](diversions|statoverride|status))[.][0-9]+[.]gz$' -or
+        $p -match '/var/lib/cassandra/saved_caches/') { return $true }
+    if ($p -match '/var/lib/cassandra/data/' -and
+        $p -notmatch '/system_auth/roles-[^/]+/[^/]+-data[.]db$') { return $true }
+    return $false
 }
 
 function Write-CleanSummary {
@@ -3428,7 +3442,7 @@ function Write-CleanSummary {
     }
 
     $cleanInteresting = @($script:Interesting | Where-Object {
-        -not (Test-CleanNoisePath -Path $_.Path -IncludePackageCaches)
+        -not (Test-CleanNoiseInterest -Finding $_)
     })
     $encrypted = @($cleanInteresting | Where-Object { $_.Category -like 'ENCRYPTED_CREDENTIAL_LEAD*' } | Sort-Object Category, Path)
     Write-CleanFindings -Title "Encrypted credential leads" -Items $encrypted -Renderer {
