@@ -327,6 +327,10 @@ $script:RawPatterns = @(
        Regex = '(?is)<(?:Administrator)?Password>\s*<Value>([^<]{2,})(?:</Value>)?' }
     @{ Label = 'xml_password_tag';
        Regex = '(?i)<(Password|Passphrase|Passwd|Pwd)>\s*([^\s<][^<]{2,})</(Password|Passphrase|Passwd|Pwd)>' }
+    @{ Label = 'xml_named_password';
+       Regex = '(?i)<[A-Za-z][A-Za-z0-9:_-]*\b[^>]*\b(?:name|key)\s*=\s*["''](?:password|passwd|passphrase|pwd)["''][^>]*\bvalue\s*=\s*["''][^"''<>]{2,}["''][^>]*>' }
+    @{ Label = 'xml_named_password';
+       Regex = '(?i)<[A-Za-z][A-Za-z0-9:_-]*\b[^>]*\bvalue\s*=\s*["''][^"''<>]{2,}["''][^>]*\b(?:name|key)\s*=\s*["''](?:password|passwd|passphrase|pwd)["''][^>]*>' }
     # `["']?` before the operator so the canonical .reg export form
     # "DefaultPassword"="value" is matched (now that UTF-16 .reg files are read).
     @{ Label = 'autologon_password';
@@ -630,12 +634,14 @@ $script:FalsePositives = @(
 
 function Test-FalsePositive { param([string]$Value)
     if ($null -eq $Value) { return $true }
-    $v = $Value.Trim().Trim('"', "'", ' ', ';', ',', ')')
+    $v = $Value.Trim().Trim('"', "'", ' ', ';', ',')
     $len = $v.Length
     if ($len -lt 3 -or $len -gt 256) { return $true }
 
     $lower = $v.ToLowerInvariant()
-    if ($script:FalsePositives -contains $lower) { return $true }
+    $atom = $v.TrimEnd(')', '}')
+    if ($script:FalsePositives -contains $lower -or
+        $script:FalsePositives -contains $atom.ToLowerInvariant()) { return $true }
 
     # Suffix-based template placeholders (e.g. MY_DB_PASSWORD as var name)
     if ($lower -match '_(password|secret|token|key|pass|pwd|passwordhere)$') { return $true }
@@ -661,7 +667,7 @@ function Test-FalsePositive { param([string]$Value)
     if ($lower -match 'keyvault|getsecret|secretsmanager|secretmanager|vault\.read|hvac\.') { return $true }
     if ($lower -match 'configurationmanager|boto3|ssm\.get|getparameter')        { return $true }
     # Bare dotted identifier reference (config.dbPassword, settings.password).
-    if ($v -match '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$')         { return $true }
+    if ($atom -match '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$')      { return $true }
     if ($v -match '^[A-Za-z_][A-Za-z0-9_]*\[[^\]]+\]$')                         { return $true }
     # Function-call accessor (getPassword(), get_password(), cfg.getSecret()) --
     # code that fetches a secret at runtime, not a hardcoded literal.
@@ -2019,11 +2025,11 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             if ($kwMatch.Success) {
                 $value = $line.Substring($kwMatch.Index + $kwMatch.Length)
                 $value = $value.Trim().Trim('"', "'", ' ', ';')
+                $value = $value -replace '["'']\s*/?>\s*$', ''
                 $value = ($value -split '[#;]')[0]
-                # Cut at the next `, ` or `->` boundary -- common log noise
-                # like "key = value, message = ..." would otherwise capture
-                # the whole tail.
-                $value = ($value -split ',\s+|\s+->\s+|\s+message\s*=', 2)[0]
+                if ($value -notmatch '^[A-Za-z_][A-Za-z0-9_.]*\(.*\)$') {
+                    $value = ($value -split ',\s+|\s+->\s+|\s+message\s*=', 2)[0]
+                }
             }
 
             # PHP 'key' => 'value' / define('KEY','value') / new mysqli(...,'pw')
@@ -2043,6 +2049,10 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             if ($p.Label -eq 'xml_password_tag') {
                 $mq = [regex]::Match($line, '(?i)<(Password|Passphrase|Passwd|Pwd)>\s*([^<]+)</(Password|Passphrase|Passwd|Pwd)>')
                 if ($mq.Success) { $value = $mq.Groups[2].Value.Trim() }
+            }
+            if ($p.Label -eq 'xml_named_password') {
+                $mq = [regex]::Match($line, '(?i)\bvalue\s*=\s*(?:"(?<secret>[^"]+)"|''(?<secret>[^'']+)'')')
+                if ($mq.Success) { $value = $mq.Groups['secret'].Value }
             }
 
             # -- Hard-coded line-level FP filter (real-host noise) --
@@ -3359,7 +3369,8 @@ function Test-CleanNoisePath {
 
 function Test-CleanNoiseFinding { param([object]$Finding)
     if (Test-CleanNoisePath -Path $Finding.Path) { return $true }
-    return ($Finding.Preview -match '^\s*(#|//|;|REM\s|<!--)')
+    return ($Finding.Preview -match '^\s*(#|//|;|REM\s|<!--)' -or
+            $Finding.Preview -match '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]')
 }
 
 function Write-CleanSummary {

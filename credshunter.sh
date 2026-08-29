@@ -545,6 +545,8 @@ CRED_PATTERNS=(
     # ── Windows unattend / autologon ─────────────────────────────────────
     'unattend_password|<(Administrator)?Password>[[:space:]]*<Value>[^<]{2,}'
     'xml_password_tag|<(Password|Passphrase|Passwd|Pwd)>[[:space:]]*[^<[:space:]][^<]{2,}</(Password|Passphrase|Passwd|Pwd)>'
+    'xml_named_password|<[A-Za-z][A-Za-z0-9:_-]*[^>]*(name|key)[[:space:]]*=[[:space:]]*['"'"'"](password|passwd|passphrase|pwd)['"'"'"][^>]*value[[:space:]]*=[[:space:]]*['"'"'"][^'"'"'"><]{2,}['"'"'"][^>]*>'
+    'xml_named_password|<[A-Za-z][A-Za-z0-9:_-]*[^>]*value[[:space:]]*=[[:space:]]*['"'"'"][^'"'"'"><]{2,}['"'"'"][^>]*(name|key)[[:space:]]*=[[:space:]]*['"'"'"](password|passwd|passphrase|pwd)['"'"'"][^>]*>'
     'autologon_password|(DefaultPassword|AltDefaultPassword)[[:space:]]*[:=][[:space:]"]*[^[:space:]"#]{2,}'
 
     # ── Environment-variable credentials ─────────────────────────────────
@@ -741,7 +743,7 @@ is_false_positive() {
     # Trim syntax around an extracted value.
     v="${v#"${v%%[![:space:]]*}"}"
     v="${v%"${v##*[![:space:]]}"}"
-    while [[ "$v" == *',' || "$v" == *')' ]]; do
+    while [[ "$v" == *',' ]]; do
         v="${v%?}"
     done
     v="${v%"${v##*[![:space:]]}"}"
@@ -752,10 +754,12 @@ is_false_positive() {
     [ "$len" -lt 3 ] && return 0
     [ "$len" -gt 256 ] && return 0
 
-    local lower="${v,,}"
-    local fp
+    local lower="${v,,}" atom="$v" atom_lower fp
+    atom="${atom%)}"
+    atom="${atom%\}}"
+    atom_lower="${atom,,}"
     for fp in "${FALSE_POSITIVE_EXACT[@]}"; do
-        [ "$lower" = "$fp" ] && return 0
+        { [ "$lower" = "$fp" ] || [ "$atom_lower" = "$fp" ]; } && return 0
     done
 
     # Suffix-based template vars (FOO_PASSWORD as placeholder name)
@@ -792,7 +796,7 @@ is_false_positive() {
 
     # ── Bare dotted identifier reference (config.dbPassword, settings.pass) ─
     # A code reference, not a literal. ($-prefixed form handled further down.)
-    [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$ ]] && return 0
+    [[ "$atom" =~ ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$ ]] && return 0
     [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*\[[^]]+\]$ ]] && return 0
 
     # ── Function-call accessor (getPassword(), get_password(), cfg.getSecret())
@@ -1498,9 +1502,13 @@ classify_line() {
                 value="${BASH_REMATCH[3]}"
                 value="${value%%#*}"
                 value="${value%%;*}"
-                # Stop at the next field.
-                value="${value%%, *}"
-                value="${value%% -> *}"
+                if [[ ! "$value" =~ ^[A-Za-z_][A-Za-z0-9_.]*\(.*\)$ ]]; then
+                    value="${value%%, *}"
+                    value="${value%% -> *}"
+                fi
+                if [[ "$value" =~ ^(.*)[\'\"][[:space:]]*/?\>[[:space:]]*$ ]]; then
+                    value="${BASH_REMATCH[1]}"
+                fi
             fi
             # PHP 'key' => 'value' / define('KEY','value') shapes: the generic
             # extractor above leaves a messy "=> 'value'" prefix, so take the
@@ -1515,6 +1523,13 @@ classify_line() {
                 xml_password_tag)
                     if [[ "$content" =~ \<(Password|Passphrase|Passwd|Pwd)\>[[:space:]]*([^[:space:]\<][^\<]{2,})\</(Password|Passphrase|Passwd|Pwd)\> ]]; then
                         value="${BASH_REMATCH[2]}"
+                    fi
+                    ;;
+                xml_named_password)
+                    if [[ "$content" =~ value[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]]; then
+                        value="${BASH_REMATCH[1]}"
+                    elif [[ "$content" =~ value[[:space:]]*=[[:space:]]*\'([^\']+)\' ]]; then
+                        value="${BASH_REMATCH[1]}"
                     fi
                     ;;
             esac
@@ -2582,7 +2597,8 @@ prepare_clean_high() {
                    q ~ /[.]jar$/ ||
                    q ~ /\/usr\/share\/[^/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)$/ ||
-                   preview ~ /^[[:space:]]*(#|\/\/|;|REM[[:space:]]|<!--)/
+                   preview ~ /^[[:space:]]*(#|\/\/|;|REM[[:space:]]|<!--)/ ||
+                   preview ~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/
         }
         !noisy($2, $4) { print }
     ' "$HIGH_FILE" | sort -u >"$out"
