@@ -299,6 +299,12 @@ STAGE2_EXTENSIONS=(
 ENCRYPTED_LEAD_EXTENSIONS=(
     axx enc encrypted aes gpg pgp
 )
+KNOWN_ZIP_FORMAT_EXTENSIONS=(
+    jar war ear apk aab ipa nupkg snupkg whl egg vsix xpi
+    docx docm dotx dotm xlsx xlsm xltx xltm
+    pptx pptm potx potm ppsx ppsm
+    odt ods odp epub
+)
 
 # -- Stage 3 -- high-value file types (match = [INTEREST]) -------------------
 # Files matching these are surfaced but not auto-classified as credentials.
@@ -1252,8 +1258,12 @@ inspect_referenced_target() {
     fi
     if [ -n "$ext" ] && has_ext_in "$ext" "${ENCRYPTED_LEAD_EXTENSIONS[@]}"; then
         record_interest "ENCRYPTED_CREDENTIAL_LEAD" "$resolved"
+        return 0
     fi
     if kind=$(detect_artifact_magic "$resolved"); then
+        if [ "$kind" = "zip_container" ] && has_ext_in "$ext" "${KNOWN_ZIP_FORMAT_EXTENSIONS[@]}"; then
+            return 0
+        fi
         case "$kind" in
             pem_material|keepass_container) record_interest "CREDENTIAL_CONTAINER/$kind" "$resolved" ;;
             *)                              record_interest "CREDENTIAL_LEAD/$kind" "$resolved" ;;
@@ -2259,6 +2269,9 @@ find_high_value_files() {
                 continue
             fi
             if kind=$(detect_artifact_magic "$f"); then
+                if [ "$kind" = "zip_container" ] && has_ext_in "$ext" "${KNOWN_ZIP_FORMAT_EXTENSIONS[@]}"; then
+                    continue
+                fi
                 case "$kind" in
                     pem_material)                   record_private_key_if_present "$f" || true ;;
                     keepass_container)              record_interest "CREDENTIAL_CONTAINER/$kind" "$f" ;;

@@ -100,6 +100,13 @@ respaldos del gestor de paquetes y componentes de Cassandra sin datos de
 autenticación. `NOISE_SUPPRESSED` indica cuántos elementos crudos se ocultaron.
 El modo completo los conserva para una revisión exhaustiva.
 
+Los formatos cifrados explícitos como `.axx` se conservan como pistas de
+credenciales cifradas. Los respaldos genéricos como `.zip` quedan como archivos
+interesantes de menor prioridad. Los formatos conocidos basados en ZIP,
+incluidos paquetes como `.jar`, `.war`, `.whl` y `.nupkg`, no se convierten en
+pistas sólo por su contenedor. Los nombres sospechosos y el contenido con
+credenciales se siguen reportando por separado.
+
 El modo limpio muestra todas las entradas restantes. Ningún hallazgo o pista se
 oculta detrás de un límite de presentación. Las credenciales idénticas que se
 repiten en el mismo archivo se muestran una vez con todas sus líneas y el total

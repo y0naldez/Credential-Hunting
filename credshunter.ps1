@@ -785,6 +785,12 @@ $script:Stage2Extensions = @(
 $script:EncryptedLeadExtensions = @(
     '.axx','.enc','.encrypted','.aes','.gpg','.pgp'
 )
+$script:KnownZipFormatExtensions = @(
+    '.jar','.war','.ear','.apk','.aab','.ipa','.nupkg','.snupkg','.whl','.egg','.vsix','.xpi'
+    '.docx','.docm','.dotx','.dotm','.xlsx','.xlsm','.xltx','.xltm'
+    '.pptx','.pptm','.potx','.potm','.ppsx','.ppsm'
+    '.odt','.ods','.odp','.epub'
+)
 
 # -- Stage 3 -- high-value file types (match = [INTEREST]) -------------------
 # Three sub-arrays drive the Stage 3 detector: extensions, exact filenames,
@@ -918,6 +924,8 @@ $script:Stage2ExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]$script:Stage2Extensions, [System.StringComparer]::OrdinalIgnoreCase)
 $script:EncryptedLeadExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]$script:EncryptedLeadExtensions, [System.StringComparer]::OrdinalIgnoreCase)
+$script:KnownZipFormatExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]$script:KnownZipFormatExtensions, [System.StringComparer]::OrdinalIgnoreCase)
 $script:Stage3ExtensionsSet = [System.Collections.Generic.HashSet[string]]::new(
     [string[]]$script:Stage3Extensions, [System.StringComparer]::OrdinalIgnoreCase)
 $script:Stage3GlobPatternsLower = @($script:Stage3GlobPatterns | ForEach-Object { $_.ToLowerInvariant() })
@@ -1766,9 +1774,11 @@ function Invoke-ReferencedTargetInspection {
     }
     if ($script:EncryptedLeadExtensionsSet.Contains($ext)) {
         Add-Interesting -Category 'ENCRYPTED_CREDENTIAL_LEAD' -Path $fi.FullName
+        return
     }
     $kind = Get-ArtifactMagicKind -FullPath $fi.FullName
     if ($kind) {
+        if ($kind -eq 'zip_container' -and $script:KnownZipFormatExtensionsSet.Contains($ext)) { return }
         $cat = if ($kind -match 'pem|keepass') { 'CREDENTIAL_CONTAINER' } else { 'CREDENTIAL_LEAD' }
         Add-Interesting -Category "$cat/$kind" -Path $fi.FullName
     }
@@ -3191,6 +3201,7 @@ function Find-HighValueFiles { param($Files)
         if (-not $matched -and $f.Size -gt 0 -and $f.Size -le 52428800) {
             $kind = Get-ArtifactMagicKind -FullPath $f.Path
             if ($kind) {
+                if ($kind -eq 'zip_container' -and $script:KnownZipFormatExtensionsSet.Contains($f.Ext)) { continue }
                 if ($kind -eq 'pem_material') {
                     $privateHeader = Get-PrivateKeyHeader -FullPath $f.Path
                     if ($privateHeader) {

@@ -140,6 +140,13 @@ non-authentication Cassandra components. `NOISE_SUPPRESSED` reports how many raw
 items were omitted from that view. Full mode retains those raw matches for
 exhaustive review.
 
+Explicit encrypted formats such as `.axx` remain encrypted credential leads.
+Generic backup archives such as `.zip` remain lower-priority interesting files.
+Known ZIP-based formats, including software packages such as `.jar`, `.war`,
+`.whl`, and `.nupkg`, are not promoted to credential leads solely because of
+their container format. Suspicious names and credential content are still
+reported independently.
+
 Every remaining entry is shown in clean mode. No findings or leads are hidden
 behind a display limit. Identical credentials repeated in the same file are
 shown once with every matching line number and an occurrence count.
