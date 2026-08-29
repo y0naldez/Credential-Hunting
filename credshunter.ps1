@@ -3436,7 +3436,8 @@ function Write-CleanSummary {
         $_.Category -ne 'REFERENCE' -and
         $_.Category -notlike 'USER_ARTIFACT*'
     } | Sort-Object Category, Path)
-    Write-CleanFindings -Title "Other interesting files" -Items $other -Limit 10 -Renderer {
+
+    Write-CleanFindings -Title "Other interesting files" -Items $other -Limit $other.Count -Renderer {
         param($i)
         Write-CleanLine ("  $($script:CC)[INTEREST]$($script:CNC) {0}  {1}" -f $i.Category, $i.Path)
     }

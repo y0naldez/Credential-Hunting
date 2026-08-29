@@ -98,6 +98,11 @@ código y cachés de dependencias instaladas (por ejemplo Ruby gems,
 elementos crudos se ocultaron. El modo completo conserva esas coincidencias
 para una revisión exhaustiva.
 
+Todas las entradas restantes de `Other interesting files` se muestran en modo
+limpio. Esa sección no se trunca porque al final podría existir un respaldo,
+una base de datos, una captura de red o un archivo comprimido que requiera
+revisión manual.
+
 La detección de llaves se basa en el contenido, no sólo en el nombre: un archivo
 sin extensión como `~/.ssh/keys/root` se clasifica como `[KEY]` si contiene una
 cabecera privada real. Las cadenas PEM incrustadas dentro de código fuente y los

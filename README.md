@@ -138,6 +138,10 @@ gems, `node_modules`, and Python site-packages). `NOISE_SUPPRESSED` reports how
 many raw items were omitted from that view. Full mode retains those raw matches
 for exhaustive review.
 
+All remaining entries under `Other interesting files` are shown in clean mode;
+that section is not truncated because its tail may contain a backup, database,
+packet capture, or archive that needs manual inspection.
+
 Private-key detection is content-based: an extensionless file such as
 `~/.ssh/keys/root` is reported as `[KEY]` when it contains a real private-key
 header. PEM-like strings embedded in source code and public package-manager

@@ -2568,9 +2568,9 @@ print_clean_other_interest() {
     local rendered
     while IFS= read -r rendered || [ -n "$rendered" ]; do
         clean_line "$rendered"
-    done < <(awk -F'\t' -v limit=10 -v color="$C" -v nc="$NC" -v dim="$D" '
-        NR <= limit { printf "  %s[INTEREST]%s %s  %s\n", color, nc, $1, $2 }
-        END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }' "$tmp")
+
+    done < <(awk -F'\t' -v color="$C" -v nc="$NC" '
+        { printf "  %s[INTEREST]%s %s  %s\n", color, nc, $1, $2 }' "$tmp")
     rm -f "$tmp"
 }
 
