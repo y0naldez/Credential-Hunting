@@ -139,7 +139,8 @@ raw items were omitted from that view. Full mode retains those raw matches for
 exhaustive review.
 
 Every remaining entry is shown in clean mode. No findings or leads are hidden
-behind a display limit.
+behind a display limit. Identical credentials repeated in the same file are
+shown once with every matching line number and an occurrence count.
 
 Private-key detection is content-based: an extensionless file such as
 `~/.ssh/keys/root` is reported as `[KEY]` when it contains a real private-key

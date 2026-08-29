@@ -3381,6 +3381,20 @@ function Write-CleanSummary {
     $high = @($script:HighFindings | Where-Object {
         -not (Test-CleanNoiseFinding -Finding $_)
     } | Sort-Object Path, LineNumber, Label)
+    $highGroups = @($high |
+        Group-Object Label, Path, Preview |
+        ForEach-Object {
+            $first = $_.Group[0]
+            $lines = @($_.Group.LineNumber | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+            [PSCustomObject]@{
+                Label = $first.Label
+                Path = $first.Path
+                Preview = $first.Preview
+                LineNumbers = $lines
+                Occurrences = $_.Group.Count
+                FirstLine = if ($lines.Count -gt 0) { $lines[0] } else { 0 }
+            }
+        } | Sort-Object Path, FirstLine, Label)
 
     # Authentication material comes first so a long password list cannot bury
     # an extensionless private key such as ~/.ssh/keys/root.
@@ -3401,9 +3415,13 @@ function Write-CleanSummary {
         Write-CleanLine ("  $($script:CR)[CRITICAL]$($script:CNC) {0,-8} {1}" -f $g.Extension, $g.Path)
     }
 
-    Write-CleanFindings -Title "Directly usable credentials" -Items $high -Renderer {
+    Write-CleanFindings -Title "Directly usable credentials" -Items $highGroups -Renderer {
         param($f)
-        $location = if ($f.LineNumber -gt 0) { "{0}: line {1}" -f $f.Path, $f.LineNumber } else { $f.Path }
+        $location = if ($f.LineNumbers.Count -eq 1) {
+            "{0}: line {1}" -f $f.Path, $f.LineNumbers[0]
+        } elseif ($f.LineNumbers.Count -gt 1) {
+            "{0}: lines {1} ({2} occurrences)" -f $f.Path, ($f.LineNumbers -join ', '), $f.Occurrences
+        } else { $f.Path }
         Write-CleanLine ("  $($script:CR)[HIGH]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $f.Label, $location)
         if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
     }

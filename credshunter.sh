@@ -2530,17 +2530,40 @@ clean_section() {
 }
 
 print_clean_tsv_findings() {
-    local title="$1" file="$2" tag="$3" color="$4"
+    local title="$1" file="$2" tag="$3" color="$4" group_repeats="${5:-0}"
     [ -s "$file" ] || return 0
     clean_section "$title"
     local rendered
-    while IFS= read -r rendered || [ -n "$rendered" ]; do
-        clean_line "$rendered"
-    done < <(sort -u "$file" | awk -F'\t' -v tag="$tag" -v color="$color" -v nc="$NC" -v dim="$D" '
-        {
-            printf "  %s[%s]%s %s  %s%s: line %s%s\n", color, tag, nc, $1, dim, $2, $3, nc
-            if ($4 != "") printf "         %s%s%s\n", dim, $4, nc
-        }')
+    if [ "$group_repeats" -eq 1 ]; then
+        while IFS= read -r rendered || [ -n "$rendered" ]; do
+            clean_line "$rendered"
+        done < <(sort -u "$file" | sort -t $'\t' -k1,1 -k2,2 -k4,4 -k3,3n |
+            awk -F'\t' -v tag="$tag" -v color="$color" -v nc="$NC" -v dim="$D" '
+                function emit( location) {
+                    if (count > 1) location = "lines " lines " (" count " occurrences)"
+                    else location = "line " lines
+                    printf "  %s[%s]%s %s  %s%s: %s%s\n", color, tag, nc, label, dim, path, location, nc
+                    if (preview != "") printf "         %s%s%s\n", dim, preview, nc
+                }
+                {
+                    key = $1 "\034" $2 "\034" $4
+                    if (NR > 1 && key != previous) emit()
+                    if (key != previous) {
+                        label = $1; path = $2; preview = $4; lines = $3; count = 1; previous = key
+                    } else {
+                        lines = lines ", " $3; count++
+                    }
+                }
+                END { if (NR > 0) emit() }')
+    else
+        while IFS= read -r rendered || [ -n "$rendered" ]; do
+            clean_line "$rendered"
+        done < <(sort -u "$file" | awk -F'\t' -v tag="$tag" -v color="$color" -v nc="$NC" -v dim="$D" '
+            {
+                printf "  %s[%s]%s %s  %s%s: line %s%s\n", color, tag, nc, $1, dim, $2, $3, nc
+                if ($4 != "") printf "         %s%s%s\n", dim, $4, nc
+            }')
+    fi
 }
 
 print_clean_interest_filter() {
@@ -2657,7 +2680,7 @@ print_clean_summary() {
             { printf "  %s[CRITICAL]%s %-8s %s\n", color, nc, $1, $2 }')
     fi
 
-    print_clean_tsv_findings "Directly usable credentials" "$clean_high" "HIGH" "$R"
+    print_clean_tsv_findings "Directly usable credentials" "$clean_high" "HIGH" "$R" 1
 
     local original_interest="$INTEREST_FILE"
     INTEREST_FILE="$clean_interest"

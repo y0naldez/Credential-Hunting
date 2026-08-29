@@ -99,7 +99,9 @@ elementos crudos se ocultaron. El modo completo conserva esas coincidencias
 para una revisión exhaustiva.
 
 El modo limpio muestra todas las entradas restantes. Ningún hallazgo o pista se
-oculta detrás de un límite de presentación.
+oculta detrás de un límite de presentación. Las credenciales idénticas que se
+repiten en el mismo archivo se muestran una vez con todas sus líneas y el total
+de apariciones.
 
 La detección de llaves se basa en el contenido, no sólo en el nombre: un archivo
 sin extensión como `~/.ssh/keys/root` se clasifica como `[KEY]` si contiene una
