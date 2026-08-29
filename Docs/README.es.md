@@ -91,6 +91,20 @@ En modo limpio, las categorías de pistas aparecen bajo el tag visual `[LEAD]`:
 
 Prioriza `[CRITICAL]`, `[HIGH]` y `[KEY]`; después revisa sesiones completas, sigue `REFERENCE`/`CREDENTIAL_LEAD` e identifica el mecanismo requerido por cada `ENCRYPTED_CREDENTIAL_LEAD`.
 
+En modo limpio, las llaves privadas aparecen antes que las coincidencias de
+password. La vista también omite ejemplos comentados y ruido procedente del
+código y cachés de dependencias instaladas (por ejemplo Ruby gems,
+`node_modules` y Python site-packages); `NOISE_SUPPRESSED` indica cuántos
+elementos crudos se ocultaron. El modo completo conserva esas coincidencias
+para una revisión exhaustiva.
+
+La detección de llaves se basa en el contenido, no sólo en el nombre: un archivo
+sin extensión como `~/.ssh/keys/root` se clasifica como `[KEY]` si contiene una
+cabecera privada real. Las cadenas PEM incrustadas dentro de código fuente y los
+keyrings públicos de gestores de paquetes no se clasifican como credenciales.
+El ruido de baja confianza suprimido tampoco cambia a `1` el código de salida en
+modo limpio.
+
 ## Uso
 
 Linux:

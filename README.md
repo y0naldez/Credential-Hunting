@@ -122,14 +122,26 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\credshunter.ps1 -Path 
 In clean mode, the final console output is grouped into:
 
 ```text
-Directly usable credentials
-Credential containers
 Private keys and auth material
+Credential containers
+Directly usable credentials
 Encrypted credential leads
 References and user-artifact leads
 Other interesting files
 Counts
 ```
+
+Clean mode is a prioritized triage view. It promotes private keys ahead of
+password matches and suppresses commented source examples plus findings
+originating in installed dependency source/package caches (for example Ruby
+gems, `node_modules`, and Python site-packages). `NOISE_SUPPRESSED` reports how
+many raw items were omitted from that view. Full mode retains those raw matches
+for exhaustive review.
+
+Private-key detection is content-based: an extensionless file such as
+`~/.ssh/keys/root` is reported as `[KEY]` when it contains a real private-key
+header. PEM-like strings embedded in source code and public package-manager
+trust keyrings are not treated as credential material.
 
 `-o` / `-OutputFile` still works with clean mode, so you can keep a file for later review while keeping the terminal readable.
 
@@ -163,7 +175,7 @@ In clean mode, `ENCRYPTED_CREDENTIAL_LEAD`, `CREDENTIAL_LEAD`, `REFERENCE`, and 
 [LEAD] USER_ARTIFACT/app_session  <session-file>
 ```
 
-Exit codes: `0` means no `CRITICAL`/`HIGH`/`KEY`; `1` means at least one actionable finding; `2` means an argument, I/O, or fatal error; and `130` means interrupted. Leads, interests, and name hints alone do not change `0` to `1`.
+Exit codes: `0` means no `CRITICAL`/`HIGH`/`KEY`; `1` means at least one actionable finding; `2` means an argument, I/O, or fatal error; and `130` means interrupted. Leads, interests, and name hints alone do not change `0` to `1`. In clean mode, suppressed low-confidence noise does not change the exit code to `1`.
 
 ## Tuning
 

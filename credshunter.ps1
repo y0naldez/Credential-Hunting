@@ -271,6 +271,7 @@ Set-Glyphs
 $script:HighFindings     = [System.Collections.Generic.List[object]]::new()
 $script:KeyFindings      = [System.Collections.Generic.List[object]]::new()
 $script:Interesting      = [System.Collections.Generic.List[object]]::new()
+$script:CleanActionableCount = 0
 $script:Guaranteed       = [System.Collections.Generic.List[object]]::new()
 $script:GuaranteedHashes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $script:SuspiciousNamesFound = [System.Collections.Generic.List[string]]::new()
@@ -531,14 +532,14 @@ $script:RawPatterns = @(
 
 # Private-key markers (separate bucket - always reported under [KEY])
 $script:KeyPatternsRaw = @(
-    @{ Label = 'rsa_private';        Regex = '-----BEGIN RSA PRIVATE KEY-----' }
-    @{ Label = 'dsa_private';        Regex = '-----BEGIN DSA PRIVATE KEY-----' }
-    @{ Label = 'ec_private';         Regex = '-----BEGIN EC PRIVATE KEY-----' }
-    @{ Label = 'openssh_private';    Regex = '-----BEGIN OPENSSH PRIVATE KEY-----' }
-    @{ Label = 'pkcs8_private';      Regex = '-----BEGIN PRIVATE KEY-----' }
-    @{ Label = 'encrypted_private';  Regex = '-----BEGIN ENCRYPTED PRIVATE KEY-----' }
-    @{ Label = 'pgp_private';        Regex = '-----BEGIN PGP PRIVATE KEY BLOCK-----' }
-    @{ Label = 'putty_private';      Regex = 'PuTTY-User-Key-File-' }
+    @{ Label = 'rsa_private';        Regex = '(?m)^[\t ]*-----BEGIN RSA PRIVATE KEY-----' }
+    @{ Label = 'dsa_private';        Regex = '(?m)^[\t ]*-----BEGIN DSA PRIVATE KEY-----' }
+    @{ Label = 'ec_private';         Regex = '(?m)^[\t ]*-----BEGIN EC PRIVATE KEY-----' }
+    @{ Label = 'openssh_private';    Regex = '(?m)^[\t ]*-----BEGIN OPENSSH PRIVATE KEY-----' }
+    @{ Label = 'pkcs8_private';      Regex = '(?m)^[\t ]*-----BEGIN PRIVATE KEY-----' }
+    @{ Label = 'encrypted_private';  Regex = '(?m)^[\t ]*-----BEGIN ENCRYPTED PRIVATE KEY-----' }
+    @{ Label = 'pgp_private';        Regex = '(?m)^[\t ]*-----BEGIN PGP PRIVATE KEY BLOCK-----' }
+    @{ Label = 'putty_private';      Regex = '(?m)^[\t ]*PuTTY-User-Key-File-' }
 )
 
 # Compile each regex once. Hot-path code reuses the [Regex] instance.
@@ -1650,23 +1651,40 @@ function Get-ArtifactMagicKind {
     return $null
 }
 
-function Test-PemPrivateMaterial { param([string]$FullPath)
+function Get-PrivateKeyHeader { param([string]$FullPath)
     $fs = $null
     try {
         $fs = [System.IO.File]::Open($FullPath, 'Open', 'Read', 'ReadWrite')
         $cap = [Math]::Min([long]$fs.Length, 1MB)
         $buf = New-Object byte[] ([int]$cap)
         $read = $fs.Read($buf, 0, $buf.Length)
-        if ($read -le 0) { return $false }
+        if ($read -le 0) { return $null }
         $text = [System.Text.Encoding]::ASCII.GetString($buf, 0, $read)
-        return ($text -match '-----BEGIN (?:RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----')
+        foreach ($pattern in $script:KeyPatterns) {
+            $match = $pattern.Regex.Match($text)
+            if ($match.Success) {
+                return [PSCustomObject]@{
+                    Label = $pattern.Label
+                    LineNumber = Get-LineNumber -Content $text -Index $match.Index
+                    Preview = $match.Value.Trim()
+                }
+            }
+        }
+        return $null
     } catch {
-        # If an otherwise high-value PEM cannot be inspected, retain it rather
-        # than silently dropping a potentially useful private key.
-        return $true
+        return $null
     } finally {
         if ($fs) { try { $fs.Dispose() } catch {} }
     }
+}
+
+function Test-PublicTrustMaterialPath { param([string]$FullPath)
+    $p = $FullPath.Replace('\','/').ToLowerInvariant()
+    return ($p -eq '/etc/apt/trusted.gpg' -or
+            $p.StartsWith('/etc/apt/trusted.gpg.d/') -or
+            $p.StartsWith('/usr/share/keyrings/') -or
+            $p.StartsWith('/etc/pki/rpm-gpg/') -or
+            $p.StartsWith('/etc/pacman.d/gnupg/'))
 }
 
 function Test-ReferenceCarrierName {
@@ -3132,10 +3150,17 @@ function Find-HighValueFiles { param($Files)
         # Stage3ExactNamesSet are OrdinalIgnoreCase, so the lowercased Name works.
         if ($script:SkipDbFilenames.Contains($f.Name)) { continue }
 
-        # A .pem containing only public certificates (for example cacerts.pem)
-        # is not reusable authentication material. Keep PEMs with private-key
-        # blocks and conservatively keep unreadable PEMs.
-        if ($f.Ext -eq '.pem' -and -not (Test-PemPrivateMaterial -FullPath $f.Path)) { continue }
+        # Promote real key material immediately, including nonstandard filenames.
+        # Public-only PEM certificates are not credentials.
+        if ($f.Ext -in '.pem','.key','.priv') {
+            $privateHeader = Get-PrivateKeyHeader -FullPath $f.Path
+            if ($privateHeader) {
+                Add-Finding -Bucket Key -Label $privateHeader.Label -Path $f.Path `
+                    -LineNumber $privateHeader.LineNumber -Preview $privateHeader.Preview
+                continue
+            }
+            if ($f.Ext -eq '.pem') { continue }
+        }
 
         if ($f.Ext -eq '.lnk') {
             Invoke-ShortcutReferenceExtraction -FullPath $f.Path
@@ -3143,6 +3168,7 @@ function Find-HighValueFiles { param($Files)
         }
 
         if ($script:EncryptedLeadExtensionsSet.Contains($f.Ext)) {
+            if (Test-PublicTrustMaterialPath -FullPath $f.Path) { continue }
             Add-Interesting -Category 'ENCRYPTED_CREDENTIAL_LEAD' -Path $f.Path
             continue
         }
@@ -3162,8 +3188,16 @@ function Find-HighValueFiles { param($Files)
         if (-not $matched -and $f.Size -gt 0 -and $f.Size -le 52428800) {
             $kind = Get-ArtifactMagicKind -FullPath $f.Path
             if ($kind) {
-                $cat = if ($kind -match 'pem|keepass') { 'CREDENTIAL_CONTAINER' } else { 'CREDENTIAL_LEAD' }
-                Add-Interesting -Category "$cat/$kind" -Path $f.Path
+                if ($kind -eq 'pem_material') {
+                    $privateHeader = Get-PrivateKeyHeader -FullPath $f.Path
+                    if ($privateHeader) {
+                        Add-Finding -Bucket Key -Label $privateHeader.Label -Path $f.Path `
+                            -LineNumber $privateHeader.LineNumber -Preview $privateHeader.Preview
+                    }
+                } else {
+                    $cat = if ($kind -eq 'keepass_container') { 'CREDENTIAL_CONTAINER' } else { 'CREDENTIAL_LEAD' }
+                    Add-Interesting -Category "$cat/$kind" -Path $f.Path
+                }
             }
         }
     }
@@ -3318,17 +3352,49 @@ function Write-CleanFindings {
     }
 }
 
+function Test-CleanNoisePath {
+    param([string]$Path, [switch]$IncludePackageCaches)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $p = $Path.Replace('\','/').ToLowerInvariant()
+    if ($p -match '/(node_modules|site-packages|dist-packages)/' -or
+        $p -match '/var/lib/gems/[0-9.]+/gems/' -or
+        $p -match '/usr/(local/)?lib/ruby/gems/' -or
+        $p -match '/vendor/bundle/' -or
+        $p -match '/credshunter[.](sh|ps1)(:|$)') { return $true }
+    if ($IncludePackageCaches -and (
+        $p -match '/var/lib/gems/[0-9.]+/cache/' -or
+        $p -match '^/etc/apt/trusted[.]gpg([.]d/|$)' -or
+        $p -match '^/usr/share/keyrings/')) { return $true }
+    return $false
+}
+
+function Test-CleanNoiseFinding { param([object]$Finding)
+    if (Test-CleanNoisePath -Path $Finding.Path) { return $true }
+    $p = $Finding.Path.Replace('\','/').ToLowerInvariant()
+    $sourceFile = $p -match '[.](rb|py|pl|php|js|ts|java|cs|go|rs|c|cc|cpp|h|hpp|ps1|sh|bash)$'
+    return ($sourceFile -and $Finding.Preview -match '^\s*(#|//|;|REM\s)')
+}
+
 function Write-CleanSummary {
     $top = 25
     Write-Section "Clean findings summary"
     Write-LogLine ""
     Write-LogLine "=== Clean findings summary ==="
 
-    $high = @($script:HighFindings | Sort-Object Path, LineNumber, Label)
-    Write-CleanFindings -Title "Directly usable credentials" -Items $high -Limit $top -Renderer {
+    $high = @($script:HighFindings | Where-Object {
+        -not (Test-CleanNoiseFinding -Finding $_)
+    } | Sort-Object Path, LineNumber, Label)
+
+    # Authentication material comes first so a long password list cannot bury
+    # an extensionless private key such as ~/.ssh/keys/root.
+    $keys = @($script:KeyFindings |
+        Sort-Object Path, Label, LineNumber |
+        Group-Object Path |
+        ForEach-Object { $_.Group | Select-Object -First 1 })
+    Write-CleanFindings -Title "Private keys and auth material" -Items $keys -Limit $top -Renderer {
         param($f)
         $location = if ($f.LineNumber -gt 0) { "{0}: line {1}" -f $f.Path, $f.LineNumber } else { $f.Path }
-        Write-CleanLine ("  $($script:CR)[HIGH]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $f.Label, $location)
+        Write-CleanLine ("  $($script:CM)[KEY]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $f.Label, $location)
         if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
     }
 
@@ -3338,22 +3404,24 @@ function Write-CleanSummary {
         Write-CleanLine ("  $($script:CR)[CRITICAL]$($script:CNC) {0,-8} {1}" -f $g.Extension, $g.Path)
     }
 
-    $keys = @($script:KeyFindings | Sort-Object Path, LineNumber, Label)
-    Write-CleanFindings -Title "Private keys and auth material" -Items $keys -Limit $top -Renderer {
+    Write-CleanFindings -Title "Directly usable credentials" -Items $high -Limit $top -Renderer {
         param($f)
         $location = if ($f.LineNumber -gt 0) { "{0}: line {1}" -f $f.Path, $f.LineNumber } else { $f.Path }
-        Write-CleanLine ("  $($script:CM)[KEY]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $f.Label, $location)
+        Write-CleanLine ("  $($script:CR)[HIGH]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $f.Label, $location)
         if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
     }
 
-    $encrypted = @($script:Interesting | Where-Object { $_.Category -like 'ENCRYPTED_CREDENTIAL_LEAD*' } | Sort-Object Category, Path)
+    $cleanInteresting = @($script:Interesting | Where-Object {
+        -not (Test-CleanNoisePath -Path $_.Path -IncludePackageCaches)
+    })
+    $encrypted = @($cleanInteresting | Where-Object { $_.Category -like 'ENCRYPTED_CREDENTIAL_LEAD*' } | Sort-Object Category, Path)
     Write-CleanFindings -Title "Encrypted credential leads" -Items $encrypted -Limit $top -Renderer {
         param($i)
         Write-CleanLine ("  $($script:CC)[LEAD]$($script:CNC) {0}  {1}" -f $i.Category, $i.Path)
     }
 
     $leadCats = @('CREDENTIAL_LEAD*','REFERENCE','USER_ARTIFACT*')
-    $leads = @($script:Interesting | Where-Object {
+    $leads = @($cleanInteresting | Where-Object {
         $cat = $_.Category
         ($leadCats | Where-Object { $cat -like $_ }).Count -gt 0 -and $cat -notlike 'ENCRYPTED_CREDENTIAL_LEAD*'
     } | Sort-Object Category, Path)
@@ -3362,7 +3430,7 @@ function Write-CleanSummary {
         Write-CleanLine ("  $($script:CY)[LEAD]$($script:CNC) {0}  {1}" -f $i.Category, $i.Path)
     }
 
-    $other = @($script:Interesting | Where-Object {
+    $other = @($cleanInteresting | Where-Object {
         $_.Category -notlike 'ENCRYPTED_CREDENTIAL_LEAD*' -and
         $_.Category -notlike 'CREDENTIAL_LEAD*' -and
         $_.Category -ne 'REFERENCE' -and
@@ -3375,9 +3443,14 @@ function Write-CleanSummary {
 
     Write-CleanLine ""
     Write-CleanLine "$($script:CBold)$($script:CW)Counts$($script:CNC)"
-    Write-CleanLine ("  HIGH: {0}  KEY: {1}  CONTAINERS: {2}  ENCRYPTED_LEADS: {3}  LEADS: {4}  OTHER_INTEREST: {5}  NAME: {6}  SKIPPED: {7}" -f `
-        $script:HighFindings.Count, $script:KeyFindings.Count, $script:Guaranteed.Count,
-        $encrypted.Count, $leads.Count, $other.Count, $script:SuspiciousNamesFound.Count, $script:SkippedFiles.Count)
+    $suppressed = ($script:HighFindings.Count - $high.Count) +
+                  ($script:KeyFindings.Count - $keys.Count) +
+                  ($script:Interesting.Count - $cleanInteresting.Count)
+    $script:CleanActionableCount = $high.Count + $keys.Count + $script:Guaranteed.Count
+    Write-CleanLine ("  HIGH: {0}  KEY: {1}  CONTAINERS: {2}  ENCRYPTED_LEADS: {3}  LEADS: {4}  OTHER_INTEREST: {5}  NOISE_SUPPRESSED: {6}  NAME: {7}  SKIPPED: {8}" -f `
+        $high.Count, $keys.Count, $script:Guaranteed.Count,
+        $encrypted.Count, $leads.Count, $other.Count, $suppressed,
+        $script:SuspiciousNamesFound.Count, $script:SkippedFiles.Count)
 
     if ($script:LogPath) {
         Write-CleanLine ""
@@ -3584,9 +3657,12 @@ function Invoke-Main {
         if ($Clean) { Write-CleanSummary } else { Write-FullSummary }
     }
 
-    if ($script:Guaranteed.Count -gt 0 -or
-        $script:HighFindings.Count -gt 0 -or
-        $script:KeyFindings.Count -gt 0) {
+    $actionable = if ($Clean) {
+        $script:CleanActionableCount
+    } else {
+        $script:Guaranteed.Count + $script:HighFindings.Count + $script:KeyFindings.Count
+    }
+    if ($actionable -gt 0) {
         exit 1
     } else {
         exit 0

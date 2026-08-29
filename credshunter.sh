@@ -85,6 +85,7 @@ PREFILTER_LINE_CAP=5000
 # still 0 when the substage returns, a "no credentials found" line is shown.
 IN_STAGE1=0
 SUBSTAGE_FINDINGS=0
+CLEAN_ACTIONABLE=0
 
 # ----------------------------------------------------------------------------
 #  Temp workspace + per-path dedup
@@ -676,14 +677,14 @@ CRED_PATTERNS=(
 
 # Private-key markers — always interesting, separate bucket
 KEY_PATTERNS=(
-    'rsa_private|-----BEGIN RSA PRIVATE KEY-----'
-    'dsa_private|-----BEGIN DSA PRIVATE KEY-----'
-    'ec_private|-----BEGIN EC PRIVATE KEY-----'
-    'openssh_private|-----BEGIN OPENSSH PRIVATE KEY-----'
-    'pkcs8_private|-----BEGIN PRIVATE KEY-----'
-    'encrypted_private|-----BEGIN ENCRYPTED PRIVATE KEY-----'
-    'pgp_private|-----BEGIN PGP PRIVATE KEY BLOCK-----'
-    'putty_private|PuTTY-User-Key-File-'
+    'rsa_private|^[[:space:]]*-----BEGIN RSA PRIVATE KEY-----'
+    'dsa_private|^[[:space:]]*-----BEGIN DSA PRIVATE KEY-----'
+    'ec_private|^[[:space:]]*-----BEGIN EC PRIVATE KEY-----'
+    'openssh_private|^[[:space:]]*-----BEGIN OPENSSH PRIVATE KEY-----'
+    'pkcs8_private|^[[:space:]]*-----BEGIN PRIVATE KEY-----'
+    'encrypted_private|^[[:space:]]*-----BEGIN ENCRYPTED PRIVATE KEY-----'
+    'pgp_private|^[[:space:]]*-----BEGIN PGP PRIVATE KEY BLOCK-----'
+    'putty_private|^[[:space:]]*PuTTY-User-Key-File-'
 )
 
 # Combined single regex (built once at startup) for fast prefiltering.
@@ -1108,11 +1109,13 @@ detect_encrypted_secret_leads() {
 detect_decryptable_config_leads() {
     local file="$1" source_label="${2:-content}" line lineno=0 value
     local decryptor_reported=0 decrypt_call_reported=0
-    grep -aEiq '(Rfc2898DeriveBytes|PasswordDeriveBytes|PBKDF2|RijndaelManaged|AesManaged|AesCryptoServiceProvider|CipherMode[.]CBC|AES-256-CBC|MODE_CBC|DecryptString|DecryptPassword|DecryptSecret)' "$file" 2>/dev/null || return 0
+    # A class/algorithm name in framework source or docs is not a decryptor.
+    # Require a constructor/invocation shape before surfacing recovery logic.
+    grep -aEiq '((new[[:space:]]+)?(Rfc2898DeriveBytes|PasswordDeriveBytes|RijndaelManaged|AesManaged|AesCryptoServiceProvider)[[:space:]]*\(|(DecryptString|DecryptPassword|DecryptSecret)[[:space:]]*\()' "$file" 2>/dev/null || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         lineno=$((lineno + 1))
         [ "$lineno" -gt 5000 ] && break
-        if [[ "$line" =~ (Rfc2898DeriveBytes|PasswordDeriveBytes|PBKDF2|RijndaelManaged|AesManaged|AesCryptoServiceProvider|CipherMode[.]CBC|AES-256-CBC|MODE_CBC) ]]; then
+        if [[ "$line" =~ (new[[:space:]]+)?(Rfc2898DeriveBytes|PasswordDeriveBytes|RijndaelManaged|AesManaged|AesCryptoServiceProvider)[[:space:]]*\( ]]; then
             if [ "$decryptor_reported" -eq 0 ]; then
                 record_encrypted_secret_lead "dotnet_crypto_decryptor" "$file" "$lineno" "hardcoded/local decryptor logic may recover config secrets"
                 decryptor_reported=1
@@ -1166,6 +1169,33 @@ detect_artifact_magic() {
     local tar_magic
     tar_magic=$(dd if="$file" bs=1 skip=257 count=5 2>/dev/null)
     [ "$tar_magic" = "ustar" ] && { printf 'tar_container'; return 0; }
+    return 1
+}
+
+# Record a private key only when its format header starts a real line. This
+# rejects strings embedded in source-code tables while handling arbitrary,
+# extensionless names such as ~/.ssh/keys/root.
+record_private_key_if_present() {
+    local file="$1" entry label regex match
+    [ -r "$file" ] || return 1
+    for entry in "${KEY_PATTERNS[@]}"; do
+        label="${entry%%|*}"
+        regex="${entry#*|}"
+        match=$(LC_ALL=C grep -anE -m1 -- "$regex" "$file" 2>/dev/null) || continue
+        [ -n "$match" ] || continue
+        record_finding KEY "$label" "$file" "${match%%:*}" "$(sanitize "${match#*:}")"
+        return 0
+    done
+    return 1
+}
+
+# Package-manager signing keyrings are public trust anchors, not encrypted
+# credentials. Do not send them to the credential-lead queue.
+public_trust_material_path() {
+    local p="${1,,}"
+    case "$p" in
+        /etc/apt/trusted.gpg|/etc/apt/trusted.gpg.d/*|/usr/share/keyrings/*|/etc/pki/rpm-gpg/*|/etc/pacman.d/gnupg/*) return 0 ;;
+    esac
     return 1
 }
 
@@ -2198,9 +2228,17 @@ find_high_value_files() {
             [ "$skip" -eq 1 ] && continue
             local ext="${bn##*.}"
             if [ "$ext" != "$bn" ] && has_ext_in "$ext" "${ENCRYPTED_LEAD_EXTENSIONS[@]}"; then
+                public_trust_material_path "$f" && continue
                 record_interest "ENCRYPTED_CREDENTIAL_LEAD" "$f"
                 continue
             fi
+            case "${ext,,}" in
+                pem|key|priv)
+                    if record_private_key_if_present "$f"; then continue; fi
+                    ;;
+            esac
+            # A public certificate in a .pem file is not authentication material.
+            [ "${ext,,}" = "pem" ] && continue
             record_interest "high_value_file" "$f"
         done < <(find "$path" "${FIND_EXCLUDE_ARGS[@]}" -type f "${name_expr[@]}" -print0 2>/dev/null)
 
@@ -2219,7 +2257,8 @@ find_high_value_files() {
             fi
             if kind=$(detect_artifact_magic "$f"); then
                 case "$kind" in
-                    pem_material|keepass_container) record_interest "CREDENTIAL_CONTAINER/$kind" "$f" ;;
+                    pem_material)                   record_private_key_if_present "$f" || true ;;
+                    keepass_container)              record_interest "CREDENTIAL_CONTAINER/$kind" "$f" ;;
                     *)                              record_interest "CREDENTIAL_LEAD/$kind" "$f" ;;
                 esac
             fi
@@ -2542,12 +2581,67 @@ count_interest_filter() {
     awk -F'\t' -v pat="$pattern" '$1 ~ pat { print $0 }' "$INTEREST_FILE" | sort -u | wc -l | tr -d ' '
 }
 
+# Clean mode is a triage view. Raw findings remain available in full mode, but
+# installed dependency source and package caches are dominated by API examples,
+# variable references, and archive signatures rather than host credentials.
+prepare_clean_high() {
+    local out="$1"
+    [ -s "$HIGH_FILE" ] || { : >"$out"; return; }
+    awk -F'\t' '
+        function noisy(p, preview, q, src) {
+            q=tolower(p)
+            src = q ~ /[.](rb|py|pl|php|js|ts|java|cs|go|rs|c|cc|cpp|h|hpp|ps1|sh|bash)$/
+            return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
+                   q ~ /\/var\/lib\/gems\/[0-9.]+\/gems\// ||
+                   q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
+                   q ~ /\/vendor\/bundle\// ||
+                   q ~ /\/credshunter[.](sh|ps1)$/ ||
+                   (src && preview ~ /^[[:space:]]*(#|\/\/|;|REM[[:space:]])/)
+        }
+        !noisy($2, $4) { print }
+    ' "$HIGH_FILE" | sort -u >"$out"
+}
+
+prepare_clean_keys() {
+    local out="$1"
+    [ -s "$KEY_FILE" ] || { : >"$out"; return; }
+    # Stage 1 and content inspection may recognize the same key under different
+    # labels. One path is one actionable key in the clean triage view.
+    sort -t $'\t' -k2,2 -k1,1 "$KEY_FILE" |
+        awk -F'\t' '!seen[$2]++ { print }' >"$out"
+}
+
+prepare_clean_interest() {
+    local out="$1"
+    [ -s "$INTEREST_FILE" ] || { : >"$out"; return; }
+    awk -F'\t' '
+        function noisy(p, q) {
+            q=tolower(p)
+            return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
+                   q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|cache)\// ||
+                   q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
+                   q ~ /\/vendor\/bundle\// ||
+                   q ~ /\/credshunter[.](sh|ps1)(:|$)/ ||
+                   q ~ /^\/etc\/apt\/trusted[.]gpg([.]d\/|$)/ ||
+                   q ~ /^\/usr\/share\/keyrings\//
+        }
+        !noisy($2) { print }
+    ' "$INTEREST_FILE" | sort -u >"$out"
+}
+
 print_clean_summary() {
     section "Clean findings summary"
     log_line ""
     log_line "=== Clean findings summary ==="
 
-    print_clean_tsv_findings "Directly usable credentials" "$HIGH_FILE" "HIGH" "$R" 25
+    local clean_high="$TMPDIR/clean-high.tsv" clean_keys="$TMPDIR/clean-keys.tsv" clean_interest="$TMPDIR/clean-interest.tsv"
+    prepare_clean_high "$clean_high"
+    prepare_clean_keys "$clean_keys"
+    prepare_clean_interest "$clean_interest"
+
+    # Authentication material comes first so a long password list cannot bury
+    # an extensionless private key such as ~/.ssh/keys/root.
+    print_clean_tsv_findings "Private keys and auth material" "$clean_keys" "KEY" "$M" 25
 
     if [ -s "$GUARANTEED_FILE" ]; then
         clean_section "Credential containers"
@@ -2559,26 +2653,38 @@ print_clean_summary() {
             END { if (NR > limit) printf "  %s... %d more hidden in clean view%s\n", dim, NR - limit, nc }')
     fi
 
-    print_clean_tsv_findings "Private keys and auth material" "$KEY_FILE" "KEY" "$M" 25
+    print_clean_tsv_findings "Directly usable credentials" "$clean_high" "HIGH" "$R" 25
+
+    local original_interest="$INTEREST_FILE"
+    INTEREST_FILE="$clean_interest"
     print_clean_interest_filter "Encrypted credential leads" '^ENCRYPTED_CREDENTIAL_LEAD' "LEAD" "$C" 25
     print_clean_interest_filter "References and user-artifact leads" '^(CREDENTIAL_LEAD|REFERENCE|USER_ARTIFACT)' "LEAD" "$Y" 25
     print_clean_other_interest
+    INTEREST_FILE="$original_interest"
 
     local n_guar n_high n_key n_int n_name n_skip n_enc n_leads n_other
     n_guar=$( [ -s "$GUARANTEED_FILE" ] && sort -u "$GUARANTEED_FILE" | wc -l | tr -d ' ' || echo 0)
-    n_high=$( [ -s "$HIGH_FILE" ] && sort -u "$HIGH_FILE" | wc -l | tr -d ' ' || echo 0)
-    n_key=$( [ -s "$KEY_FILE" ] && sort -u "$KEY_FILE" | wc -l | tr -d ' ' || echo 0)
-    n_int=$( [ -s "$INTEREST_FILE" ] && sort -u "$INTEREST_FILE" | wc -l | tr -d ' ' || echo 0)
+    n_high=$( [ -s "$clean_high" ] && wc -l <"$clean_high" | tr -d ' ' || echo 0)
+    n_key=$( [ -s "$clean_keys" ] && wc -l <"$clean_keys" | tr -d ' ' || echo 0)
+    n_int=$( [ -s "$clean_interest" ] && wc -l <"$clean_interest" | tr -d ' ' || echo 0)
     n_name=$( [ -s "$NAME_FILE" ] && sort -u "$NAME_FILE" | wc -l | tr -d ' ' || echo 0)
     n_skip=$( [ -s "$SKIPPED_FILE" ] && sort -u "$SKIPPED_FILE" | wc -l | tr -d ' ' || echo 0)
+    INTEREST_FILE="$clean_interest"
     n_enc=$(count_interest_filter '^ENCRYPTED_CREDENTIAL_LEAD')
     n_leads=$(count_interest_filter '^(CREDENTIAL_LEAD|REFERENCE|USER_ARTIFACT)')
+    INTEREST_FILE="$original_interest"
     n_other=$(( n_int - n_enc - n_leads ))
     [ "$n_other" -lt 0 ] && n_other=0
 
     clean_line ""
     clean_line "${BOLD}${W}Counts${NC}"
-    clean_line "  HIGH: $n_high  KEY: $n_key  CONTAINERS: $n_guar  ENCRYPTED_LEADS: $n_enc  LEADS: $n_leads  OTHER_INTEREST: $n_other  NAME: $n_name  SKIPPED: $n_skip"
+    local raw_high raw_key raw_int suppressed
+    raw_high=$( [ -s "$HIGH_FILE" ] && sort -u "$HIGH_FILE" | wc -l | tr -d ' ' || echo 0)
+    raw_key=$( [ -s "$KEY_FILE" ] && sort -u "$KEY_FILE" | wc -l | tr -d ' ' || echo 0)
+    raw_int=$( [ -s "$INTEREST_FILE" ] && sort -u "$INTEREST_FILE" | wc -l | tr -d ' ' || echo 0)
+    suppressed=$(( raw_high - n_high + raw_key - n_key + raw_int - n_int ))
+    CLEAN_ACTIONABLE=$(( n_high + n_key + n_guar ))
+    clean_line "  HIGH: $n_high  KEY: $n_key  CONTAINERS: $n_guar  ENCRYPTED_LEADS: $n_enc  LEADS: $n_leads  OTHER_INTEREST: $n_other  NOISE_SUPPRESSED: $suppressed  NAME: $n_name  SKIPPED: $n_skip"
 
     if [ -n "$OUTPUT_FILE" ]; then
         clean_line ""
@@ -2651,7 +2757,8 @@ main() {
         print_summary
     fi
 
-    if [ -s "$GUARANTEED_FILE" ] || [ -s "$HIGH_FILE" ] || [ -s "$KEY_FILE" ]; then
+    if { [ "$CLEAN" -eq 1 ] && [ "$CLEAN_ACTIONABLE" -gt 0 ]; } ||
+       { [ "$CLEAN" -eq 0 ] && { [ -s "$GUARANTEED_FILE" ] || [ -s "$HIGH_FILE" ] || [ -s "$KEY_FILE" ]; }; }; then
         exit 1
     fi
     exit 0
