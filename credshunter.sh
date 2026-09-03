@@ -2623,6 +2623,25 @@ prepare_clean_high() {
     local out="$1"
     [ -s "$HIGH_FILE" ] || { : >"$out"; return; }
     awk -F'\t' '
+        # Translation catalogs often use credential-looking message IDs such
+        # as `ftp_login_pass` whose values are UI labels ("FTP Password",
+        # "Mot de passe FTP", ...), not credentials.  Treat them as clean-view
+        # noise only when the same PHP-array key appears in at least three
+        # sibling catalog files with at least two distinct translations.
+        function catalog_cluster(label, p, preview, q, dir, key, s) {
+            if (label !~ /(^|\/)php_array_secret$/) return ""
+            q="/" tolower(p)
+            gsub(/[\\]/, "/", q)
+            if (q !~ /\/(languages?|lang|locales?|i18n|l10n|translations?)\//) return ""
+            if (preview !~ /^[[:space:]]*[\047\042][^\047\042]+[\047\042][[:space:]]*=>[[:space:]]*[\047\042]/) return ""
+            s=preview
+            sub(/^[^\047\042]*[\047\042]/, "", s)
+            key=s
+            sub(/[\047\042].*$/, "", key)
+            dir=q
+            sub(/\/[^\/]*$/, "", dir)
+            return dir "\034" tolower(key)
+        }
         function noisy(p, preview, q, r) {
             q=tolower(p)
             r=tolower(preview)
@@ -2637,8 +2656,22 @@ prepare_clean_high() {
                    r ~ /^[[:space:]]*(#|;|[/][/]|--([[:space:]]|$)|rem([[:space:]]|$)|<!--|[/][*])/ ||
                    r ~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/
         }
-        !noisy($2, $4) { print }
-    ' "$HIGH_FILE" | sort -u >"$out"
+        NR == FNR {
+            cluster=catalog_cluster($1, $2, $4)
+            if (cluster != "") {
+                file_key=cluster SUBSEP tolower($2)
+                value_key=cluster SUBSEP tolower($4)
+                if (!seen_file[file_key]++) files[cluster]++
+                if (!seen_value[value_key]++) values[cluster]++
+            }
+            next
+        }
+        {
+            cluster=catalog_cluster($1, $2, $4)
+            if (cluster != "" && files[cluster] >= 3 && values[cluster] >= 2) next
+            if (!noisy($2, $4)) print
+        }
+    ' "$HIGH_FILE" "$HIGH_FILE" | sort -u >"$out"
 }
 
 prepare_clean_commented() {

@@ -3388,6 +3388,37 @@ function Test-CleanNoiseFinding { param([object]$Finding)
             $Finding.Preview -match '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]')
 }
 
+function Get-CleanLocalizationCatalogNoise {
+    param([object[]]$Findings)
+
+    # Translation catalogs commonly contain credential-looking message IDs
+    # such as `ftp_login_pass`, but their values are UI labels rather than
+    # secrets.  Suppress a cluster only when the same PHP-array key occurs in
+    # at least three sibling catalog files with at least two distinct rendered
+    $rows = foreach ($finding in $Findings) {
+        if ($finding.Label -notmatch '(?:^|/)php_array_secret$') { continue }
+        $normalizedPath = $finding.Path.Replace('\','/').ToLowerInvariant()
+        if ($normalizedPath -notmatch '(?:^|/)(?:languages?|lang|locales?|i18n|l10n|translations?)/') { continue }
+        $match = [regex]::Match($finding.Preview, '^\s*(?<quote>[''"])(?<key>[^''"]+)\k<quote>\s*=>\s*[''"]')
+        if (-not $match.Success) { continue }
+        $directory = $normalizedPath -replace '/[^/]+$', ''
+        [PSCustomObject]@{
+            Finding = $finding
+            Cluster = $directory + [char]0x1C + $match.Groups['key'].Value.ToLowerInvariant()
+        }
+    }
+
+    $noise = [System.Collections.Generic.List[object]]::new()
+    foreach ($group in @($rows | Group-Object Cluster)) {
+        $distinctFiles = @($group.Group.Finding.Path | Sort-Object -Unique).Count
+        $distinctValues = @($group.Group.Finding.Preview | Sort-Object -Unique).Count
+        if ($distinctFiles -ge 3 -and $distinctValues -ge 2) {
+            foreach ($row in $group.Group) { $noise.Add($row.Finding) }
+        }
+    }
+    return ,$noise
+}
+
 function Test-CleanNoiseInterest { param([object]$Finding)
     if (Test-CleanNoisePath -Path $Finding.Path -IncludePackageCaches) { return $true }
     if ($Finding.Category -ne 'high_value_file') { return $false }
@@ -3406,8 +3437,10 @@ function Write-CleanSummary {
     Write-LogLine ""
     Write-LogLine "=== Clean findings summary ==="
 
+    $localizationCatalogNoise = Get-CleanLocalizationCatalogNoise -Findings $script:HighFindings
     $high = @($script:HighFindings | Where-Object {
-        -not (Test-CleanNoiseFinding -Finding $_)
+        -not (Test-CleanNoiseFinding -Finding $_) -and
+        -not $localizationCatalogNoise.Contains($_)
     } | Sort-Object Path, LineNumber, Label)
     $highGroups = @($high |
         Group-Object Label, Path, Preview |
@@ -3426,6 +3459,7 @@ function Write-CleanSummary {
 
     $commented = @($script:HighFindings | Where-Object {
         (Test-CleanCommentedFinding -Finding $_) -and
+        -not $localizationCatalogNoise.Contains($_) -and
         -not (Test-CleanNoisePath -Path $_.Path) -and
         $_.Preview -notmatch '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]'
     } | Sort-Object Path, LineNumber, Label)

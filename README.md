@@ -137,9 +137,12 @@ historical-leads section. It suppresses package documentation and installed
 dependency artifacts (for example Ruby gems, `.jar` files,
 `node_modules`, and Python site-packages). It also omits name-only hits for
 public certificates, system scripts, routine logs, package-manager backups, and
-non-authentication Cassandra components. `NOISE_SUPPRESSED` reports how many raw
-items were omitted from that view. Full mode retains those raw matches for
-exhaustive review.
+non-authentication Cassandra components. Repeated PHP localization entries such
+as `ftp_login_pass => "FTP Password"` are also collapsed as catalog noise when
+the same key appears with different translations across at least three sibling
+language files. Isolated values remain visible. `NOISE_SUPPRESSED` reports how
+many raw items were omitted from that view. Full mode retains those raw matches
+for exhaustive review.
 
 Explicit encrypted formats such as `.axx` remain encrypted credential leads.
 Generic backup archives such as `.zip` remain lower-priority interesting files.
