@@ -31,7 +31,7 @@ export LC_ALL=C   # consistent regex / sort behavior regardless of host locale
 # miss content like "Password=..." even though grep -i finds it.
 shopt -s nocasematch 2>/dev/null || true
 
-VERSION="2.4.1"
+VERSION="2.5.0"
 
 # Pre-initialise color vars so `err()` and friends work BEFORE setup_colors
 # runs (e.g. when parse_args reports a bad flag).
@@ -68,6 +68,9 @@ LIVE_PREVIEW_LEN=2000
 # loop. 16 KB comfortably covers single-line GPP Groups.xml / one-line JSON
 # connection strings while bounding worst-case CPU. Mirrored in the PS engine.
 MAX_LINE_LEN=16384
+# The SQL correlation pass is additive, not a deep-database mode. Keep its
+# in-memory lexer bounded even when --no-size-limit is requested.
+MAX_SQL_STRUCTURED_BYTES=$((8 * 1024 * 1024))
 # Stage-1 live-output state. When IN_STAGE1=1, the record_* helpers stream
 # each finding to stderr as it's discovered so the operator sees results in
 # real time. SUBSTAGE_FINDINGS is reset before each substage runs; if it is
@@ -533,13 +536,6 @@ CRED_PATTERNS=(
     # value FP filter removes references/placeholders. Placed AFTER db_password
     # so the well-known prefixes keep their specific label.
     'prefixed_password|[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?([\\]+"|[^[:space:]"#$<>{}]){3,}'
-
-    # SQL/HSQLDB property stores serialize a sensitive property name and its
-    # value as adjacent quoted fields instead of a key=value assignment:
-    # INSERT INTO OFPROPERTY VALUES('mail.smtp.password','ActualSecret',0,NULL)
-    # Keep this INSERT/VALUES-scoped to avoid treating arbitrary string arrays
-    # as credentials. SQL single-quote escaping (two adjacent quotes) is allowed.
-    'sql_insert_secret|[Ii][Nn][Ss][Ee][Rr][Tt][[:space:]]+([Ii][Nn][Tt][Oo][[:space:]]+)?[^;]*[Vv][Aa][Ll][Uu][Ee][Ss][[:space:]]*\([[:space:]]*'"'"'[A-Za-z0-9_.-]*(password|passwd|passphrase|pwd|secret)[A-Za-z0-9_.-]*'"'"'[[:space:]]*,[[:space:]]*([Nn])?'"'"'([^'"'"']|'"'"''"'"'){3,}'"'"''
 
     # ── Connection-string passwords (SQL Server / .NET / JDBC / generic) ─
     # Allow arbitrary content (incl. semicolons) between the server= clause
@@ -1532,12 +1528,6 @@ classify_line() {
             # last quoted literal on the line as the value before FP-filtering
             # (e.g.  'password' => 'changeme'  ->  changeme).
             case "$label" in
-                sql_insert_secret)
-                    if [[ "$content" =~ [\'\"][A-Za-z0-9_.-]*(password|passwd|passphrase|pwd|secret)[A-Za-z0-9_.-]*[\'\"][[:space:]]*,[[:space:]]*([Nn])?\'(([^\']|\'\'){3,})\' ]]; then
-                        value="${BASH_REMATCH[3]}"
-                        value="${value//\'\'/\'}"
-                    fi
-                    ;;
                 drupal_password|php_array_secret|wp_db_password)
                     if [[ "$content" =~ .*[\'\"]([^\'\"]+)[\'\"][^\'\"]*$ ]]; then
                         value="${BASH_REMATCH[1]}"
@@ -1584,6 +1574,191 @@ classify_line() {
         fi
     done
     return 1
+}
+
+# SQL-aware extraction is isolated from the generic regex loop. It runs only on
+# textual SQL-like files that contain a sensitive keyword, and uses one bounded
+# awk lexer pass to correlate INSERT column lists with later value tuples. This
+# preserves the normal 16 KB per-line safety limit while supporting compact or
+# multi-line logical dumps.
+is_sql_text_file() {
+    local lower="${1,,}"
+    case "$lower" in
+        *.sql|*.ddl|*.dump|*.psql|*.pgsql|*.plsql|*.tsql|*.script|*/openfire.log) return 0 ;;
+    esac
+    return 1
+}
+
+scan_sql_structured_credentials() {
+    local file="$1" source_label="$2" newline_mode=0
+    is_sql_text_file "$file" || return 0
+    grep -qiE '(password|passwd|pwd|passphrase|secret)' -- "$file" 2>/dev/null || return 0
+    local sql_size
+    sql_size=$(file_size "$file")
+    [ "$sql_size" -gt 0 ] && [ "$sql_size" -le "$MAX_SQL_STRUCTURED_BYTES" ] || return 0
+    case "${file,,}" in *.script|*/openfire.log) newline_mode=1 ;; esac
+
+    local line kind column table secret
+    while IFS=$'\t' read -r line kind column table secret || [ -n "$line$kind$column$table$secret" ]; do
+        [ -n "$secret" ] || continue
+        is_false_positive "$secret" && continue
+        [ -n "$table" ] || table='?'
+        record_finding HIGH "${source_label}/${kind}" "$file" "$line" \
+            "$(sanitize "table=$table column=$column value=$secret")"
+    done < <(
+        awk -v newline_mode="$newline_mode" '
+        BEGIN { SQ=sprintf("%c",39); DQ=sprintf("%c",34); BT=sprintf("%c",96); data="" }
+        { data=data $0 "\n" }
+
+        function trim(s) { sub(/^[[:space:]]+/,"",s); sub(/[[:space:]]+$/,"",s); return s }
+        function clear(a, k) { for (k in a) delete a[k] }
+        function clean_name(s, a,n) {
+            s=trim(s); gsub(/[[:space:]"`\[\]]/,"",s); n=split(s,a,"."); return tolower(a[n])
+        }
+        function sensitive(s, n) {
+            n=clean_name(s)
+            return n=="passwordkey" || n ~ /^(password|passwd|pwd|passphrase|secret)$/ || n ~ /(^|[_$-])(password|passwd|pwd|passphrase|secret)$/
+        }
+        function value_column(s, n) {
+            n=clean_name(s)
+            return n ~ /^(value|val|propvalue|propertyvalue|settingvalue|configvalue|optionvalue|secretvalue)$/ || n ~ /(^|_)(value|val)$/
+        }
+        function literal(expr, q,body,prefix) {
+            LIT_OK=0; LIT_VALUE=""; expr=trim(expr)
+            prefix=toupper(substr(expr,1,2))
+            if (substr(expr,1,1) ~ /[NnEe]/ && (substr(expr,2,1)==SQ || substr(expr,2,1)==DQ)) expr=substr(expr,2)
+            else if (prefix=="U&" && substr(expr,3,1)==SQ) expr=substr(expr,3)
+            q=substr(expr,1,1)
+            if ((q!=SQ && q!=DQ) || substr(expr,length(expr),1)!=q) return
+            body=substr(expr,2,length(expr)-2)
+            if (q==SQ) gsub(SQ SQ,SQ,body); else gsub(DQ DQ,DQ,body)
+            LIT_OK=1; LIT_VALUE=body
+        }
+        function split_csv(text,out, i,c,q,depth,start,n,nextc) {
+            clear(out); q=""; depth=0; start=1; n=0
+            for (i=1;i<=length(text);i++) {
+                c=substr(text,i,1); nextc=substr(text,i+1,1)
+                if (q!="") {
+                    if (c=="\\") { i++; continue }
+                    if (c==q) { if (nextc==q) i++; else q="" }
+                    continue
+                }
+                if (c==SQ || c==DQ || c==BT) { q=c; continue }
+                if (c=="(") { depth++; continue }
+                if (c==")") { if (depth>0) depth--; continue }
+                if (c=="," && depth==0) { out[++n]=trim(substr(text,start,i-start)); start=i+1 }
+            }
+            out[++n]=trim(substr(text,start)); return n
+        }
+        function keyword_pos(text,word,start, i,c,q,nextc,before,after,part) {
+            q=""; word=toupper(word)
+            for (i=start;i<=length(text)-length(word)+1;i++) {
+                c=substr(text,i,1); nextc=substr(text,i+1,1)
+                if (q!="") {
+                    if (c=="\\") { i++; continue }
+                    if (c==q) { if (nextc==q) i++; else q="" }
+                    continue
+                }
+                if (c==SQ || c==DQ || c==BT) { q=c; continue }
+                part=toupper(substr(text,i,length(word))); if (part!=word) continue
+                before=(i==1 ? "" : substr(text,i-1,1)); after=substr(text,i+length(word),1)
+                if (before !~ /[A-Za-z0-9_]/ && after !~ /[A-Za-z0-9_]/) return i
+            }
+            return 0
+        }
+        function close_paren(text,open, i,c,q,nextc,depth) {
+            q=""; depth=0
+            for (i=open;i<=length(text);i++) {
+                c=substr(text,i,1); nextc=substr(text,i+1,1)
+                if (q!="") { if(c=="\\"){i++;continue} if(c==q){if(nextc==q)i++;else q=""} continue }
+                if(c==SQ||c==DQ||c==BT){q=c;continue} if(c=="(")depth++; else if(c==")"&&--depth==0)return i
+            }
+            return 0
+        }
+        function newline_count(s, t) { t=s; return gsub(/\n/,"",t) }
+        function safe_field(s) { gsub(/[\t\r\n]/," ",s); return s }
+        function emit(line,kind,column,table,secret) {
+            secret=safe_field(secret); column=safe_field(column); table=safe_field(table)
+            if(length(secret)>=3 && length(secret)<=256) print line "\t" kind "\t" column "\t" table "\t" secret
+        }
+        function parse_tuple(body,line,table,hascols, n,i,key,secret,column) {
+            n=split_csv(body,FIELDS)
+            if(hascols) for(i=1;i<=COLCOUNT && i<=n;i++) if(sensitive(COLS[i])) {
+                literal(FIELDS[i]); if(LIT_OK) { secret=LIT_VALUE; column=clean_name(COLS[i]); emit(line,"sql_insert_column_secret",column,table,secret) }
+            }
+            for(i=1;i<n;i++) {
+                literal(FIELDS[i]); if(!LIT_OK) continue; key=LIT_VALUE
+                if(!sensitive(key)) continue
+                literal(FIELDS[i+1]); if(LIT_OK) emit(line,"sql_insert_secret",key,table,LIT_VALUE)
+            }
+        }
+        function parse_tuples(stmt,values,values_at,startline,table,hascols, i,c,q,nextc,depth,open,line) {
+            q=""; depth=0; open=0
+            for(i=1;i<=length(values);i++) {
+                c=substr(values,i,1); nextc=substr(values,i+1,1)
+                if(q!="") { if(c=="\\"){i++;continue} if(c==q){if(nextc==q)i++;else q=""} continue }
+                if(c==SQ||c==DQ){q=c;continue}
+                if(c=="("){if(depth==0)open=i;depth++;continue}
+                if(c==")"&&depth>0){depth--;if(depth==0){line=startline+newline_count(substr(stmt,1,values_at+open-1));parse_tuple(substr(values,open+1,i-open-1),line,table,hascols)}}
+            }
+        }
+        function find_sensitive_literal(text, i,c,q,nextc,start) {
+            FOUND_KEY=""; q=""; start=0
+            for(i=1;i<=length(text);i++) {
+                c=substr(text,i,1); nextc=substr(text,i+1,1)
+                if(q=="") { if(c==SQ||c==DQ){q=c;start=i}; continue }
+                if(c=="\\"){i++;continue}
+                if(c==q){if(nextc==q){i++;continue};literal(substr(text,start,i-start+1));if(LIT_OK&&sensitive(LIT_VALUE)){FOUND_KEY=LIT_VALUE;return 1};q=""}
+            }
+            return 0
+        }
+        function equals_pos(text, i,c,q,nextc,depth) {
+            q="";depth=0
+            for(i=1;i<=length(text);i++){c=substr(text,i,1);nextc=substr(text,i+1,1);if(q!=""){if(c=="\\"){i++;continue}if(c==q){if(nextc==q)i++;else q=""}continue}if(c==SQ||c==DQ||c==BT){q=c;continue}if(c=="(")depth++;else if(c==")"&&depth>0)depth--;else if(c=="="&&depth==0)return i}
+            return 0
+        }
+        function parse_insert(stmt,startline, upper,m,rest,intoLen,tableLen,table,tableEnd,vpos,tail,openPos,closePos,colsText,hascols,values) {
+            upper=toupper(stmt)
+            if(match(upper,/^[[:space:]]*(INSERT([[:space:]]+IGNORE)?|REPLACE|MERGE)[[:space:]]+/)==0)return 0
+            rest=substr(stmt,RLENGTH+1); tableEnd=RLENGTH
+            if(match(toupper(rest),/^INTO[[:space:]]+/)){tableEnd+=RLENGTH;rest=substr(rest,RLENGTH+1)}
+            if(match(rest,/^[^[:space:](]+/)==0)return 1
+            table=substr(rest,1,RLENGTH);tableLen=RLENGTH;tableEnd+=tableLen
+            vpos=keyword_pos(stmt,"VALUES",tableEnd+1);if(!vpos)return 1
+            tail=substr(stmt,tableEnd+1,vpos-tableEnd-1);hascols=0;clear(COLS);COLCOUNT=0
+            if(match(tail,/^[[:space:]]*\(/)){openPos=RSTART+RLENGTH-1;closePos=close_paren(tail,openPos);if(closePos){colsText=substr(tail,openPos+1,closePos-openPos-1);COLCOUNT=split_csv(colsText,COLS);hascols=COLCOUNT>0}}
+            values=substr(stmt,vpos+6);parse_tuples(stmt,values,vpos+6,startline,table,hascols);return 1
+        }
+        function parse_update(stmt,startline, upper,m,rest,table,setpos,wherepos,wheretext,settext,n,i,eq,column,line) {
+            upper=toupper(stmt);if(match(upper,/^[[:space:]]*UPDATE[[:space:]]+/)==0)return 0
+            rest=substr(stmt,RLENGTH+1);if(match(rest,/^[^[:space:]]+/)==0)return 1;table=substr(rest,1,RLENGTH)
+            setpos=keyword_pos(stmt,"SET",RLENGTH+1);wherepos=keyword_pos(stmt,"WHERE",setpos+3);if(!setpos||!wherepos)return 1
+            wheretext=substr(stmt,wherepos+5);if(!find_sensitive_literal(wheretext))return 1
+            settext=substr(stmt,setpos+3,wherepos-setpos-3);n=split_csv(settext,ASSIGNS)
+            line=startline+newline_count(substr(stmt,1,setpos))
+            for(i=1;i<=n;i++){eq=equals_pos(ASSIGNS[i]);if(!eq)continue;column=substr(ASSIGNS[i],1,eq-1);if(!value_column(column))continue;literal(substr(ASSIGNS[i],eq+1));if(LIT_OK)emit(line,"sql_update_secret",FOUND_KEY,table,LIT_VALUE)}
+            return 1
+        }
+        function process(stmt,startline) { stmt=trim(stmt);if(stmt=="")return;if(parse_insert(stmt,startline))return;parse_update(stmt,startline) }
+        function parse_all( i,c,nextc,state,stmt,startline,line) {
+            state=0;stmt="";startline=1;line=1
+            for(i=1;i<=length(data);i++){
+                c=substr(data,i,1);nextc=substr(data,i+1,1)
+                if(state==4){if(c=="\n"){if(newline_mode){process(stmt,startline);stmt="";line++;startline=line}else{stmt=stmt c;line++;state=0}}continue}
+                if(state==5){if(c=="\n"){stmt=stmt c;line++}if(c=="*"&&nextc=="/"){i++;stmt=stmt " ";state=0}continue}
+                if(state>0){stmt=stmt c;if(c=="\n")line++;if(c=="\\"){stmt=stmt nextc;i++;continue}q=(state==1?SQ:(state==2?DQ:BT));if(c==q){if(nextc==q){stmt=stmt nextc;i++}else state=0}continue}
+                if(c=="-"&&nextc=="-"){i++;stmt=stmt " ";state=4;continue}
+                if(c=="/"&&nextc=="*"){i++;stmt=stmt " ";state=5;continue}
+                if(c==SQ){state=1;stmt=stmt c;continue}if(c==DQ){state=2;stmt=stmt c;continue}if(c==BT){state=3;stmt=stmt c;continue}
+                if(c==";"||(newline_mode&&c=="\n")){process(stmt,startline);stmt="";if(c=="\n")line++;startline=line;continue}
+                if(c=="\n"&&trim(stmt)==""){stmt="";line++;startline=line;continue}
+                stmt=stmt c;if(c=="\n")line++
+            }
+            process(stmt,startline)
+        }
+        END { parse_all() }
+        ' "$file"
+    )
 }
 
 # Scan one file. Handles size, binary, dedup, and pattern matching.
@@ -1641,6 +1816,7 @@ scan_file() {
     is_binary "$file" && { record_skip "$file" "binary"; return; }
     detect_encrypted_secret_leads "$file"
     detect_decryptable_config_leads "$file" "$source_label"
+    scan_sql_structured_credentials "$file" "$source_label"
     if reference_carrier_name "$file" "$source_label"; then
         extract_reference_leads "$file" "$source_label"
     fi
@@ -2565,9 +2741,9 @@ clean_section() {
 }
 
 print_clean_tsv_findings() {
-    local title="$1" file="$2" tag="$3" color="$4" group_repeats="${5:-0}"
+    local title="$1" file="$2" tag="$3" color="$4" group_repeats="${5:-0}" show_title="${6:-1}"
     [ -s "$file" ] || return 0
-    clean_section "$title"
+    [ "$show_title" -eq 1 ] && clean_section "$title"
     local rendered
     if [ "$group_repeats" -eq 1 ]; then
         while IFS= read -r rendered || [ -n "$rendered" ]; do
@@ -2599,6 +2775,52 @@ print_clean_tsv_findings() {
                 if ($4 != "") printf "         %s%s%s\n", dim, $4, nc
             }')
     fi
+}
+
+print_clean_sql_aware_high() {
+    local file="$1"
+    [ -s "$file" ] || return 0
+    local non_sql="$TMPDIR/clean-high-nonsql.$$" sql="$TMPDIR/clean-high-sql.$$"
+    awk -F'\t' '$1 !~ /\/sql_(insert_column_secret|insert_secret|update_secret)$/ { print }' "$file" >"$non_sql"
+    awk -F'\t' '$1 ~ /\/sql_(insert_column_secret|insert_secret|update_secret)$/ { print }' "$file" >"$sql"
+
+    clean_section "Directly usable credentials"
+    print_clean_tsv_findings "" "$non_sql" "HIGH" "$R" 1 0
+
+    local rendered
+    while IFS= read -r rendered || [ -n "$rendered" ]; do
+        clean_line "$rendered"
+    done < <(sort -u "$sql" | sort -t $'\t' -k2,2 -k1,1 -k3,3n |
+        awk -F'\t' -v color="$R" -v warn="$Y" -v nc="$NC" -v dim="$D" '
+            function emit( i, hidden, location) {
+                if (count <= 2) {
+                    for (i = 1; i <= count; i++) {
+                        location = (line[i] > 0 ? ": line " line[i] : "")
+                        printf "  %s[HIGH]%s %s  %s%s%s%s\n", color, nc, label, dim, path, location, nc
+                        if (preview[i] != "") printf "         %s%s%s\n", dim, preview[i], nc
+                    }
+                    return
+                }
+                printf "  %s[HIGH]%s %s  %s%s: %d credentials detected%s\n", color, nc, label, dim, path, count, nc
+                for (i = 1; i <= 2; i++) {
+                    location = (line[i] > 0 ? "line " line[i] : "line unknown")
+                    printf "         %sexample %d (%s): %s%s\n", dim, i, location, preview[i], nc
+                }
+                hidden = count - 2
+                printf "         %sREVIEW ENTIRE SQL FILE; %d additional credentials not shown in clean mode.%s\n", warn, hidden, nc
+            }
+            {
+                key = $1 "\034" $2
+                if (NR > 1 && key != previous) emit()
+                if (key != previous) {
+                    delete line; delete preview
+                    label = $1; path = $2; count = 0; previous = key
+                }
+                count++
+                if (count <= 2) { line[count] = $3; preview[count] = $4 }
+            }
+            END { if (NR > 0) emit() }')
+    rm -f "$non_sql" "$sql"
 }
 
 print_clean_interest_filter() {
@@ -2796,7 +3018,7 @@ print_clean_summary() {
             { printf "  %s[CRITICAL]%s %-8s %s\n", color, nc, $1, $2 }')
     fi
 
-    print_clean_tsv_findings "Directly usable credentials" "$clean_high" "HIGH" "$R" 1
+    print_clean_sql_aware_high "$clean_high"
     print_clean_tsv_findings "Commented or historical credential leads" "$clean_commented" "LEAD" "$Y" 1
 
     local original_interest="$INTEREST_FILE"

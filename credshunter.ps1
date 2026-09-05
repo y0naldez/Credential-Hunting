@@ -125,7 +125,7 @@ param(
     [switch] $Help
 )
 
-$script:Version = '2.4.1'
+$script:Version = '2.5.0'
 
 # Minimalistic, Linux-style usage. Shown for -Help / -h and when the script is
 # run with no parameters at all. (Get-Help .\credshunter.ps1 still gives the full
@@ -190,6 +190,9 @@ $script:MaxLivePreviewLen = 2000
 # one-line JSON connection strings while bounding .NET regex backtracking on
 # minified/base64/log lines. Mirrored in the bash engine (MAX_LINE_LEN).
 $script:MaxLineLen        = 16384
+# Additive SQL correlation remains bounded even under -NoSizeLimit. Larger
+# dumps continue through the traditional scanner and can be targeted manually.
+$script:MaxSqlStructuredChars = 8MB
 
 # Normalise user exclusions to absolute paths (no symlink resolution)
 $script:UserExcludePaths = @()
@@ -309,12 +312,6 @@ $script:RawPatterns = @(
     # nova_password, app_password, mail_pass, ...). Value FP filter prunes refs.
     @{ Label = 'prefixed_password';
        Regex = '(?im)[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s"#<>{}]){3,}' }
-
-    # SQL/HSQLDB property stores use adjacent fields rather than key=value:
-    # INSERT INTO OFPROPERTY VALUES('mail.smtp.password','ActualSecret',0,NULL)
-    # The INSERT/VALUES scope prevents arbitrary string arrays from matching.
-    @{ Label = 'sql_insert_secret';
-       Regex = '(?i)\bINSERT\s+(?:INTO\s+)?[^;]*?\bVALUES\s*\(\s*''[A-Za-z0-9_.-]*(?:password|passwd|passphrase|pwd|secret)[A-Za-z0-9_.-]*''\s*,\s*(?:N)?''(?<secret>(?:''''|[^'']){3,})''' }
 
     # ---- Connection-string passwords (.NET / JDBC / ODBC) -------------------
     @{ Label = 'connection_string';
@@ -1480,7 +1477,9 @@ function Add-Finding {
         [int]   $LineNumber,
         [string]$Preview
     )
-    $key = "$Bucket|$Label|$Path|$LineNumber"
+    # Preview participates in dedup so compact multi-row SQL INSERT statements
+    # can report multiple distinct credentials that physically share one line.
+    $key = "$Bucket|$Label|$Path|$LineNumber|$Preview"
     if (-not $script:FindingHashes.Add($key)) { return }
     $obj = [PSCustomObject]@{
         Label = $Label; Path = $Path; LineNumber = $LineNumber; Preview = $Preview
@@ -1863,6 +1862,253 @@ function Invoke-ShortcutReferenceExtraction {
 #  Content scanning core
 # ============================================================================
 
+# SQL-aware extraction is deliberately separate from the generic per-line regex
+# loop. Logical dumps often put the sensitive column in an INSERT header and the
+# values on later lines, or put thousands of tuples on one line. A small lexer
+# correlates only quoted literals in SQL-like files, preserving the global 16 KB
+# line guard used to protect the normal scanner from minified/binary-like input.
+function Test-SqlTextPath { param([string]$FullPath)
+    $ext = [System.IO.Path]::GetExtension($FullPath).ToLowerInvariant()
+    if ($ext -in '.sql','.ddl','.dump','.psql','.pgsql','.plsql','.tsql','.script') { return $true }
+    return ([System.IO.Path]::GetFileName($FullPath) -ieq 'openfire.log')
+}
+
+function Test-SensitiveSqlName { param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    $n = ($Name -replace '[\s"`\[\]]', '').ToLowerInvariant()
+    if ($n.Contains('.')) { $n = ($n -split '\.')[-1] }
+    if ($n -eq 'passwordkey') { return $true }
+    return ($n -match '^(?:password|passwd|pwd|passphrase|secret)$' -or
+            $n -match '(?:^|[_$-])(?:password|passwd|pwd|passphrase|secret)$')
+}
+
+function Test-SqlValueColumn { param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    $n = ($Name -replace '[\s"`\[\]]', '').ToLowerInvariant()
+    if ($n.Contains('.')) { $n = ($n -split '\.')[-1] }
+    return ($n -match '^(?:value|val|propvalue|propertyvalue|settingvalue|configvalue|optionvalue|secretvalue)$' -or
+            $n -match '(?:^|_)(?:value|val)$')
+}
+
+function ConvertFrom-SqlStringLiteral { param([string]$Expression)
+    if ($null -eq $Expression) { return $null }
+    $e = $Expression.Trim()
+    $m = [regex]::Match($e, '^(?:N|E|U&)?\s*''(?<v>(?:''''|\\.|[^''])*)''\s*$', 'IgnoreCase')
+    if ($m.Success) {
+        return (($m.Groups['v'].Value -replace '''''', '''') -replace '\\''', '''')
+    }
+    $m = [regex]::Match($e, '^(?:N|E)?\s*"(?<v>(?:""|\\.|[^"])*)"\s*$', 'IgnoreCase')
+    if ($m.Success) { return ($m.Groups['v'].Value -replace '""', '"') }
+    return $null
+}
+
+function Split-SqlCsv { param([string]$Text)
+    $items = [System.Collections.Generic.List[string]]::new()
+    $sb = [System.Text.StringBuilder]::new()
+    $quote = [char]0; $depth = 0
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $c = $Text[$i]
+        if ($quote -ne [char]0) {
+            [void]$sb.Append($c)
+            if ($c -eq '\\' -and $i + 1 -lt $Text.Length) {
+                $i++; [void]$sb.Append($Text[$i]); continue
+            }
+            if ($c -eq $quote) {
+                if ($i + 1 -lt $Text.Length -and $Text[$i + 1] -eq $quote) {
+                    $i++; [void]$sb.Append($Text[$i]); continue
+                }
+                $quote = [char]0
+            }
+            continue
+        }
+        if ($c -eq "'" -or $c -eq '"' -or $c -eq '`') {
+            $quote = $c; [void]$sb.Append($c); continue
+        }
+        if ($c -eq '(') { $depth++; [void]$sb.Append($c); continue }
+        if ($c -eq ')') { if ($depth -gt 0) { $depth-- }; [void]$sb.Append($c); continue }
+        if ($c -eq ',' -and $depth -eq 0) {
+            $items.Add($sb.ToString().Trim()); [void]$sb.Clear(); continue
+        }
+        [void]$sb.Append($c)
+    }
+    $items.Add($sb.ToString().Trim())
+    return $items.ToArray()
+}
+
+function Find-SqlKeyword { param([string]$Text, [string]$Keyword, [int]$StartIndex = 0)
+    $quote = [char]0
+    for ($i = $StartIndex; $i -le $Text.Length - $Keyword.Length; $i++) {
+        $c = $Text[$i]
+        if ($quote -ne [char]0) {
+            if ($c -eq '\\' -and $i + 1 -lt $Text.Length) { $i++; continue }
+            if ($c -eq $quote) {
+                if ($i + 1 -lt $Text.Length -and $Text[$i + 1] -eq $quote) { $i++; continue }
+                $quote = [char]0
+            }
+            continue
+        }
+        if ($c -eq "'" -or $c -eq '"' -or $c -eq '`') { $quote = $c; continue }
+        if ([string]::Compare($Text, $i, $Keyword, 0, $Keyword.Length, $true, [Globalization.CultureInfo]::InvariantCulture) -ne 0) { continue }
+        $beforeOk = $i -eq 0 -or $Text[$i - 1] -notmatch '[A-Za-z0-9_]'
+        $after = $i + $Keyword.Length
+        $afterOk = $after -ge $Text.Length -or $Text[$after] -notmatch '[A-Za-z0-9_]'
+        if ($beforeOk -and $afterOk) { return $i }
+    }
+    return -1
+}
+
+function Get-SqlStatements { param([string]$Content, [switch]$NewlineTerminated)
+    $sb = [System.Text.StringBuilder]::new()
+    $state = 'normal'; $startLine = 1; $line = 1
+    for ($i = 0; $i -lt $Content.Length; $i++) {
+        $c = $Content[$i]; $next = if ($i + 1 -lt $Content.Length) { $Content[$i + 1] } else { [char]0 }
+        if ($state -eq 'linecomment') {
+            if ($c -eq "`n") { [void]$sb.Append($c); $line++; $state = 'normal' }
+            continue
+        }
+        if ($state -eq 'blockcomment') {
+            if ($c -eq "`n") { [void]$sb.Append($c); $line++ }
+            if ($c -eq '*' -and $next -eq '/') { $i++; [void]$sb.Append(' '); $state = 'normal' }
+            continue
+        }
+        if ($state -ne 'normal') {
+            [void]$sb.Append($c)
+            if ($c -eq "`n") { $line++ }
+            if ($c -eq '\\' -and $i + 1 -lt $Content.Length) { $i++; [void]$sb.Append($Content[$i]); continue }
+            $expected = switch ($state) { 'single' { "'" } 'double' { '"' } default { '`' } }
+            if ($c -eq $expected) {
+                if ($i + 1 -lt $Content.Length -and $Content[$i + 1] -eq $expected) { $i++; [void]$sb.Append($Content[$i]); continue }
+                $state = 'normal'
+            }
+            continue
+        }
+        if ($c -eq '-' -and $next -eq '-') { $i++; [void]$sb.Append(' '); $state = 'linecomment'; continue }
+        if ($c -eq '/' -and $next -eq '*') { $i++; [void]$sb.Append(' '); $state = 'blockcomment'; continue }
+        if ($c -eq "'") { $state = 'single'; [void]$sb.Append($c); continue }
+        if ($c -eq '"') { $state = 'double'; [void]$sb.Append($c); continue }
+        if ($c -eq '`') { $state = 'backtick'; [void]$sb.Append($c); continue }
+        if ($c -eq ';' -or ($NewlineTerminated -and $c -eq "`n")) {
+            $text = $sb.ToString().Trim()
+            if ($text) { [PSCustomObject]@{ Text = $text; StartLine = $startLine } }
+            [void]$sb.Clear()
+            if ($c -eq "`n") { $line++; $startLine = $line } else { $startLine = $line }
+            continue
+        }
+        [void]$sb.Append($c)
+        if ($c -eq "`n") { $line++; if ($sb.ToString().Trim().Length -eq 0) { $startLine = $line } }
+    }
+    $text = $sb.ToString().Trim()
+    if ($text) { [PSCustomObject]@{ Text = $text; StartLine = $startLine } }
+}
+
+function Get-SqlValueTuples { param([string]$Text)
+    $quote = [char]0; $depth = 0; $start = -1
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $c = $Text[$i]
+        if ($quote -ne [char]0) {
+            if ($c -eq '\\' -and $i + 1 -lt $Text.Length) { $i++; continue }
+            if ($c -eq $quote) {
+                if ($i + 1 -lt $Text.Length -and $Text[$i + 1] -eq $quote) { $i++; continue }
+                $quote = [char]0
+            }
+            continue
+        }
+        if ($c -eq "'" -or $c -eq '"') { $quote = $c; continue }
+        if ($c -eq '(') { if ($depth -eq 0) { $start = $i }; $depth++; continue }
+        if ($c -eq ')' -and $depth -gt 0) {
+            $depth--
+            if ($depth -eq 0 -and $start -ge 0) {
+                [PSCustomObject]@{ Body = $Text.Substring($start + 1, $i - $start - 1); RelativeIndex = $start }
+                $start = -1
+            }
+        }
+    }
+}
+
+function Get-SqlLineAtIndex { param([string]$Text, [int]$Index, [int]$StartLine)
+    if ($Index -le 0) { return $StartLine }
+    return $StartLine + [regex]::Matches($Text.Substring(0, [Math]::Min($Index, $Text.Length)), "`n").Count
+}
+
+function Add-SqlCredentialFinding {
+    param([string]$SourceLabel,[string]$Kind,[string]$Column,[string]$Table,[string]$Secret,[string]$Path,[int]$Line)
+    if ([string]::IsNullOrEmpty($Secret) -or (Test-FalsePositive -Value $Secret)) { return }
+    $safeTable = if ($Table) { $Table } else { '?' }
+    $preview = Format-Preview ("table={0} column={1} value={2}" -f $safeTable, $Column, $Secret)
+    Add-Finding -Bucket High -Label "$SourceLabel/$Kind" -Path $Path -LineNumber $Line -Preview $preview
+}
+
+function Invoke-SqlTextCredentialDetection {
+    param([string]$FullPath,[string]$Content,[string]$SourceLabel)
+    if (-not (Test-SqlTextPath -FullPath $FullPath)) { return }
+    if ($Content.Length -gt $script:MaxSqlStructuredChars) { return }
+    if ($Content -notmatch '(?i)password|passwd|pwd|passphrase|secret') { return }
+
+    $newlineSql = ([System.IO.Path]::GetExtension($FullPath) -ieq '.script' -or
+                   [System.IO.Path]::GetFileName($FullPath) -ieq 'openfire.log')
+    foreach ($sql in Get-SqlStatements -Content $Content -NewlineTerminated:$newlineSql) {
+        $statement = $sql.Text
+        $insert = [regex]::Match($statement, '(?is)^\s*(?<verb>INSERT(?:\s+IGNORE)?|REPLACE|MERGE)\s+(?:INTO\s+)?(?<table>["`\[]?[A-Za-z0-9_.$-]+["`\]]?)')
+        if ($insert.Success) {
+            $valuesAt = Find-SqlKeyword -Text $statement -Keyword 'VALUES' -StartIndex ($insert.Index + $insert.Length)
+            if ($valuesAt -ge 0) {
+                $table = $insert.Groups['table'].Value
+                $afterTableAt = $insert.Groups['table'].Index + $insert.Groups['table'].Length
+                $headerTail = $statement.Substring($afterTableAt, $valuesAt - $afterTableAt)
+                $columns = @(); $columnMatch = [regex]::Match($headerTail, '(?s)^\s*\((?<cols>[^()]*)\)')
+                if ($columnMatch.Success) { $columns = @(Split-SqlCsv -Text $columnMatch.Groups['cols'].Value) }
+                $valuesTextAt = $valuesAt + 6
+                $valuesText = $statement.Substring($valuesTextAt)
+                foreach ($tuple in Get-SqlValueTuples -Text $valuesText) {
+                    $fields = @(Split-SqlCsv -Text $tuple.Body)
+                    $line = Get-SqlLineAtIndex -Text $statement -Index ($valuesTextAt + $tuple.RelativeIndex) -StartLine $sql.StartLine
+                    if ($columns.Count -gt 0) {
+                        $limit = [Math]::Min($columns.Count, $fields.Count)
+                        for ($n = 0; $n -lt $limit; $n++) {
+                            if (-not (Test-SensitiveSqlName -Name $columns[$n])) { continue }
+                            $secret = ConvertFrom-SqlStringLiteral -Expression $fields[$n]
+                            if ($null -ne $secret) {
+                                $column = ($columns[$n] -replace '[\s"`\[\]]','')
+                                Add-SqlCredentialFinding -SourceLabel $SourceLabel -Kind 'sql_insert_column_secret' -Column $column -Table $table -Secret $secret -Path $FullPath -Line $line
+                            }
+                        }
+                    }
+                    for ($n = 0; $n + 1 -lt $fields.Count; $n++) {
+                        $key = ConvertFrom-SqlStringLiteral -Expression $fields[$n]
+                        if ($null -eq $key -or -not (Test-SensitiveSqlName -Name $key)) { continue }
+                        $secret = ConvertFrom-SqlStringLiteral -Expression $fields[$n + 1]
+                        if ($null -ne $secret) {
+                            Add-SqlCredentialFinding -SourceLabel $SourceLabel -Kind 'sql_insert_secret' -Column $key -Table $table -Secret $secret -Path $FullPath -Line $line
+                        }
+                    }
+                }
+            }
+            continue
+        }
+
+        $update = [regex]::Match($statement, '(?is)^\s*UPDATE\s+(?<table>["`\[]?[A-Za-z0-9_.$-]+["`\]]?)')
+        if (-not $update.Success) { continue }
+        $setAt = Find-SqlKeyword -Text $statement -Keyword 'SET' -StartIndex ($update.Index + $update.Length)
+        $whereAt = if ($setAt -ge 0) { Find-SqlKeyword -Text $statement -Keyword 'WHERE' -StartIndex ($setAt + 3) } else { -1 }
+        if ($setAt -lt 0 -or $whereAt -lt 0) { continue }
+        $where = $statement.Substring($whereAt + 5); $sensitiveKey = $null
+        foreach ($qm in [regex]::Matches($where, '(?is)(?:N|E|U&)?''(?<v>(?:''''|\\.|[^''])*)''')) {
+            $candidate = ($qm.Groups['v'].Value -replace '''''','''')
+            if (Test-SensitiveSqlName -Name $candidate) { $sensitiveKey = $candidate; break }
+        }
+        if (-not $sensitiveKey) { continue }
+        $setText = $statement.Substring($setAt + 3, $whereAt - $setAt - 3)
+        foreach ($assignment in Split-SqlCsv -Text $setText) {
+            $am = [regex]::Match($assignment, '(?is)^\s*(?<column>["`\[]?[A-Za-z0-9_.$-]+["`\]]?)\s*=\s*(?<value>.+?)\s*$')
+            if (-not $am.Success -or -not (Test-SqlValueColumn -Name $am.Groups['column'].Value)) { continue }
+            $secret = ConvertFrom-SqlStringLiteral -Expression $am.Groups['value'].Value
+            if ($null -eq $secret) { continue }
+            $line = Get-SqlLineAtIndex -Text $statement -Index $setAt -StartLine $sql.StartLine
+            Add-SqlCredentialFinding -SourceLabel $SourceLabel -Kind 'sql_update_secret' -Column $sensitiveKey -Table $update.Groups['table'].Value -Secret $secret -Path $FullPath -Line $line
+        }
+    }
+}
+
 # Single file scan. Used by both stage 1 (OS checks) and stage 5 (recursive).
 #
 # Performance design:
@@ -1937,6 +2183,7 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
 
     Invoke-EncryptedSecretLeadDetection -FullPath $FullPath -Content $content
     Invoke-DecryptableConfigLeadDetection -FullPath $FullPath -Content $content -SourceLabel $SourceLabel
+    Invoke-SqlTextCredentialDetection -FullPath $FullPath -Content $content -SourceLabel $SourceLabel
 
     $isAppSession = Test-AppSessionArtifact -FullPath $FullPath -SourceLabel $SourceLabel
     if ($isAppSession) {
@@ -2069,9 +2316,6 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             if ($p.Label -eq 'xml_named_password') {
                 $mq = [regex]::Match($line, '(?i)\bvalue\s*=\s*(?:"(?<secret>[^"]+)"|''(?<secret>[^'']+)'')')
                 if ($mq.Success) { $value = $mq.Groups['secret'].Value }
-            }
-            if ($p.Label -eq 'sql_insert_secret' -and $m.Groups['secret'].Success) {
-                $value = $m.Groups['secret'].Value -replace '''''', ''''
             }
 
             # -- Hard-coded line-level FP filter (real-host noise) --
@@ -3465,6 +3709,39 @@ function Write-CleanSummary {
                 FirstLine = if ($lines.Count -gt 0) { $lines[0] } else { 0 }
             }
         } | Sort-Object Path, FirstLine, Label)
+    $sqlFindingPattern = '/sql_(?:insert_column_secret|insert_secret|update_secret)$'
+    $nonSqlHighGroups = @($highGroups | Where-Object { $_.Label -notmatch $sqlFindingPattern })
+    $sqlHighGroups = @($high | Where-Object { $_.Label -match $sqlFindingPattern } |
+        Group-Object Label, Path |
+        ForEach-Object {
+            $ordered = @($_.Group | Sort-Object LineNumber, Preview)
+            $first = $ordered[0]
+            if ($ordered.Count -le 2) {
+                foreach ($finding in $ordered) {
+                    [PSCustomObject]@{
+                        Label = $finding.Label
+                        Path = $finding.Path
+                        Preview = $finding.Preview
+                        LineNumbers = @($finding.LineNumber | Where-Object { $_ -gt 0 })
+                        Occurrences = 1
+                        FirstLine = $finding.LineNumber
+                        IsSqlCompact = $false
+                    }
+                }
+            } else {
+                [PSCustomObject]@{
+                    Label = $first.Label
+                    Path = $first.Path
+                    Preview = ''
+                    LineNumbers = @($ordered.LineNumber | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+                    Occurrences = $ordered.Count
+                    FirstLine = $first.LineNumber
+                    IsSqlCompact = $true
+                    Examples = @($ordered | Select-Object -First 2)
+                }
+            }
+        })
+    $displayHighGroups = @($nonSqlHighGroups + $sqlHighGroups | Sort-Object Path, FirstLine, Label)
 
     $commented = @($script:HighFindings | Where-Object {
         (Test-CleanCommentedFinding -Finding $_) -and
@@ -3507,8 +3784,20 @@ function Write-CleanSummary {
         Write-CleanLine ("  $($script:CR)[CRITICAL]$($script:CNC) {0,-8} {1}" -f $g.Extension, $g.Path)
     }
 
-    Write-CleanFindings -Title "Directly usable credentials" -Items $highGroups -Renderer {
+    Write-CleanFindings -Title "Directly usable credentials" -Items $displayHighGroups -Renderer {
         param($f)
+        if ($f.PSObject.Properties['IsSqlCompact'] -and $f.IsSqlCompact) {
+            Write-CleanLine ("  $($script:CR)[HIGH]$($script:CNC) {0}  $($script:CD){1}: {2} credentials detected$($script:CNC)" -f $f.Label, $f.Path, $f.Occurrences)
+            $exampleNumber = 0
+            foreach ($example in $f.Examples) {
+                $exampleNumber++
+                $lineText = if ($example.LineNumber -gt 0) { "line $($example.LineNumber)" } else { 'line unknown' }
+                Write-CleanLine ("         $($script:CD)example {0} ({1}): {2}$($script:CNC)" -f $exampleNumber, $lineText, $example.Preview)
+            }
+            $hidden = [Math]::Max(0, $f.Occurrences - $f.Examples.Count)
+            Write-CleanLine ("         $($script:CY)REVIEW ENTIRE SQL FILE; {0} additional credentials not shown in clean mode.$($script:CNC)" -f $hidden)
+            return
+        }
         $location = if ($f.LineNumbers.Count -eq 1) {
             "{0}: line {1}" -f $f.Path, $f.LineNumbers[0]
         } elseif ($f.LineNumbers.Count -gt 1) {
