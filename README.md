@@ -39,7 +39,7 @@ CredsHunter focuses on local, reusable, or investigation-worthy credential mater
 
 | Category | Examples |
 |---|---|
-| Direct credentials | `password=...`, connection strings, basic auth URLs, Windows service command lines, WinRM/Impacket commands, PHP arrays, PHP `define()`, DB connect calls |
+| Direct credentials | `password=...`, connection strings, basic auth URLs, Windows service command lines, WinRM/Impacket commands, PHP arrays, PHP `define()`, DB connect calls, SQL property-store inserts |
 | Windows service findings | Hardcoded credentials in service `ImagePath`, command-line arguments, URLs, or string values under `Parameters`; non-built-in service accounts are retained as review leads |
 | Private keys and auth material | SSH keys, PuTTY keys, PFX/P12, keytabs, SAM/SYSTEM hives, GPP `cpassword` |
 | Credential containers | KeePass `.kdbx`, encrypted archives, `.axx`, `.enc`, `.gpg`, `.pgp`, renamed ZIP/7z/RAR/GZip/TAR files |

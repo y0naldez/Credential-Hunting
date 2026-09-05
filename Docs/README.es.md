@@ -25,7 +25,7 @@ Stage 1 comprueba ubicaciones conocidas del sistema y aplicaciones. Las etapas 2
 
 | Categoría | Ejemplos |
 |---|---|
-| Credenciales directas | `password=...`, cadenas de conexión, basic auth, comandos e historiales |
+| Credenciales directas | `password=...`, cadenas de conexión, basic auth, comandos e historiales, propiedades sensibles serializadas en sentencias SQL `INSERT` |
 | Hallazgos en servicios de Windows | Credenciales hardcodeadas en `ImagePath`, argumentos, URLs o valores de texto bajo `Parameters`; las cuentas de servicio no integradas se conservan como leads para revisión |
 | Material de autenticación | Llaves SSH/PuTTY, PFX/P12, keytabs, SAM/SYSTEM y GPP `cpassword` |
 | Contenedores | KeePass, `.axx`, `.enc`, `.gpg`, `.pgp` y archivos comprimidos renombrados |
@@ -189,3 +189,4 @@ Los leads, intereses y nombres sospechosos no cambian por sí solos `0` a `1`.
 ## Uso responsable y contribuciones
 
 Utiliza CredsHunter únicamente con autorización. Los patrones y listas de tipos están en secciones identificadas cerca del inicio de ambos scripts. Al contribuir, valida sintaxis PowerShell/Bash y prueba casos positivos, falsos positivos y contenido serializado.
+

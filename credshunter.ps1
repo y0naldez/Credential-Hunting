@@ -125,7 +125,7 @@ param(
     [switch] $Help
 )
 
-$script:Version = '2.4.0'
+$script:Version = '2.4.1'
 
 # Minimalistic, Linux-style usage. Shown for -Help / -h and when the script is
 # run with no parameters at all. (Get-Help .\credshunter.ps1 still gives the full
@@ -309,6 +309,12 @@ $script:RawPatterns = @(
     # nova_password, app_password, mail_pass, ...). Value FP filter prunes refs.
     @{ Label = 'prefixed_password';
        Regex = '(?im)[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s"#<>{}]){3,}' }
+
+    # SQL/HSQLDB property stores use adjacent fields rather than key=value:
+    # INSERT INTO OFPROPERTY VALUES('mail.smtp.password','ActualSecret',0,NULL)
+    # The INSERT/VALUES scope prevents arbitrary string arrays from matching.
+    @{ Label = 'sql_insert_secret';
+       Regex = '(?i)\bINSERT\s+(?:INTO\s+)?[^;]*?\bVALUES\s*\(\s*''[A-Za-z0-9_.-]*(?:password|passwd|passphrase|pwd|secret)[A-Za-z0-9_.-]*''\s*,\s*(?:N)?''(?<secret>(?:''''|[^'']){3,})''' }
 
     # ---- Connection-string passwords (.NET / JDBC / ODBC) -------------------
     @{ Label = 'connection_string';
@@ -2063,6 +2069,9 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             if ($p.Label -eq 'xml_named_password') {
                 $mq = [regex]::Match($line, '(?i)\bvalue\s*=\s*(?:"(?<secret>[^"]+)"|''(?<secret>[^'']+)'')')
                 if ($mq.Success) { $value = $mq.Groups['secret'].Value }
+            }
+            if ($p.Label -eq 'sql_insert_secret' -and $m.Groups['secret'].Success) {
+                $value = $m.Groups['secret'].Value -replace '''''', ''''
             }
 
             # -- Hard-coded line-level FP filter (real-host noise) --

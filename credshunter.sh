@@ -31,7 +31,7 @@ export LC_ALL=C   # consistent regex / sort behavior regardless of host locale
 # miss content like "Password=..." even though grep -i finds it.
 shopt -s nocasematch 2>/dev/null || true
 
-VERSION="2.4.0"
+VERSION="2.4.1"
 
 # Pre-initialise color vars so `err()` and friends work BEFORE setup_colors
 # runs (e.g. when parse_args reports a bad flag).
@@ -533,6 +533,13 @@ CRED_PATTERNS=(
     # value FP filter removes references/placeholders. Placed AFTER db_password
     # so the well-known prefixes keep their specific label.
     'prefixed_password|[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?([\\]+"|[^[:space:]"#$<>{}]){3,}'
+
+    # SQL/HSQLDB property stores serialize a sensitive property name and its
+    # value as adjacent quoted fields instead of a key=value assignment:
+    # INSERT INTO OFPROPERTY VALUES('mail.smtp.password','ActualSecret',0,NULL)
+    # Keep this INSERT/VALUES-scoped to avoid treating arbitrary string arrays
+    # as credentials. SQL single-quote escaping (two adjacent quotes) is allowed.
+    'sql_insert_secret|[Ii][Nn][Ss][Ee][Rr][Tt][[:space:]]+([Ii][Nn][Tt][Oo][[:space:]]+)?[^;]*[Vv][Aa][Ll][Uu][Ee][Ss][[:space:]]*\([[:space:]]*'"'"'[A-Za-z0-9_.-]*(password|passwd|passphrase|pwd|secret)[A-Za-z0-9_.-]*'"'"'[[:space:]]*,[[:space:]]*([Nn])?'"'"'([^'"'"']|'"'"''"'"'){3,}'"'"''
 
     # ── Connection-string passwords (SQL Server / .NET / JDBC / generic) ─
     # Allow arbitrary content (incl. semicolons) between the server= clause
@@ -1525,6 +1532,12 @@ classify_line() {
             # last quoted literal on the line as the value before FP-filtering
             # (e.g.  'password' => 'changeme'  ->  changeme).
             case "$label" in
+                sql_insert_secret)
+                    if [[ "$content" =~ [\'\"][A-Za-z0-9_.-]*(password|passwd|passphrase|pwd|secret)[A-Za-z0-9_.-]*[\'\"][[:space:]]*,[[:space:]]*([Nn])?\'(([^\']|\'\'){3,})\' ]]; then
+                        value="${BASH_REMATCH[3]}"
+                        value="${value//\'\'/\'}"
+                    fi
+                    ;;
                 drupal_password|php_array_secret|wp_db_password)
                     if [[ "$content" =~ .*[\'\"]([^\'\"]+)[\'\"][^\'\"]*$ ]]; then
                         value="${BASH_REMATCH[1]}"
@@ -1801,6 +1814,15 @@ check_databases() {
         /etc/postgresql/*/main/pg_hba.conf /etc/postgresql/*/main/postgresql.conf
         /etc/redis/redis.conf /etc/mongod.conf /etc/mongodb.conf
         /var/lib/pgsql/data/pg_hba.conf /etc/elasticsearch/elasticsearch.yml
+        # Openfire's embedded HSQLDB persists properties (including plaintext
+        # SMTP credentials and passwordKey) in SQL INSERT statements. Check the
+        # common package and tarball install locations even without `-p /`.
+        /var/lib/openfire/embedded-db/openfire.script
+        /var/lib/openfire/embedded-db/openfire.log
+        /opt/openfire/embedded-db/openfire.script
+        /opt/openfire/embedded-db/openfire.log
+        /usr/share/openfire/embedded-db/openfire.script
+        /usr/share/openfire/embedded-db/openfire.log
     )
     for f in "${files[@]}"; do
         for g in $f; do
