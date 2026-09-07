@@ -24,7 +24,7 @@ Documentation: **English (this file)** | [Español](Docs/README.es.md)
 A staged funnel narrows from known credential locations to suspicious files and content-level matches. The tool does not authenticate, spray, dump processes, exploit services, change files, or touch the network.
 
 ```text
- Stage 1   OS and user artifacts      registry, services, histories, vaults, sessions, shortcuts, workspaces
+ Stage 1   OS and user artifacts      registry, services, histories, mailboxes, hidden files, vaults, sessions
  Stage 2   Credential containers      kdbx, ppk, pfx, keytab, axx, enc, gpg, renamed archives
  Stage 3   High-value file types      keys, env files, backups, DBs, captures, configs
  Stage 4   Suspicious filenames       password, secret, credential, backup, vault
@@ -39,7 +39,7 @@ CredsHunter focuses on local, reusable, or investigation-worthy credential mater
 
 | Category | Examples |
 |---|---|
-| Direct credentials | `password=...`, connection strings, basic auth URLs, Windows service command lines, WinRM/Impacket commands, PHP arrays, PHP `define()`, DB connect calls, SQL property stores and column-aware multi-row inserts |
+| Direct credentials | `password=...`, prose such as `the password is "..."` or `the pass was Summer2024`, connection strings, basic auth URLs, Windows service command lines, WinRM/Impacket commands, PHP arrays, PHP `define()`, DB connect calls, SQL property stores and column-aware multi-row inserts |
 | Windows service findings | Hardcoded credentials in service `ImagePath`, command-line arguments, URLs, or string values under `Parameters`; non-built-in service accounts are retained as review leads |
 | Private keys and auth material | SSH keys, PuTTY keys, PFX/P12, keytabs, SAM/SYSTEM hives, GPP `cpassword` |
 | Credential containers | KeePass `.kdbx`, encrypted archives, `.axx`, `.enc`, `.gpg`, `.pgp`, renamed ZIP/7z/RAR/GZip/TAR files |
@@ -50,7 +50,54 @@ CredsHunter focuses on local, reusable, or investigation-worthy credential mater
 
 Cloud and SaaS API token hunting is intentionally limited to reduce noise. Local cloud CLI credential files may still be listed as interesting artifacts.
 
-On Windows, Stage 1 enumerates service `ImagePath`, `ObjectName`, and string values in each service's `Parameters` subkey. Literal passwords in command-line arguments, URLs, or password-named registry values are reported as `[HIGH]`; services running under non-built-in accounts are listed for review. Passwords managed normally by the Service Control Manager are stored as protected LSA secrets, so the tool does not attempt to extract them.
+## Targeted Stage 1 Coverage
+
+Stage 1 combines shared credential patterns with platform-specific sources that
+benefit from targeted handling.
+
+### Linux Local Artifacts
+
+Stage 1 scans readable local mbox files in `/var/mail` and `/var/spool/mail`.
+Aliased spools and hard links are deduplicated by file identity, while
+unreadable mailboxes are counted as skipped without stopping the hunt.
+
+It also content-scans regular hidden files located directly inside each home
+directory. Unusual names such as `.~`, very short dotfile names, and hidden
+names related to credentials are retained as
+`CREDENTIAL_LEAD/hidden_home_file`, even when their content does not produce a
+HIGH finding.
+
+### Windows Services
+
+Stage 1 enumerates service `ImagePath`, `ObjectName`, and string values in each
+service's `Parameters` subkey. Literal passwords in command-line arguments,
+URLs, or password-named registry values are reported as `[HIGH]`. Services
+running under non-built-in accounts are retained as review leads rather than
+being treated as confirmed passwords.
+
+Passwords managed normally by the Service Control Manager are stored as
+protected LSA secrets, so CredsHunter does not attempt to extract them.
+
+## Natural-Language Passwords
+
+Both engines recognize common ways people write credentials in notes, command
+output, and messages, including:
+
+```text
+The password is "IdealismEngineAshen476"
+The pass was Summer2024
+Password: N3w-Passphrase!
+```
+
+Quoted values are extracted directly. Unquoted values use a stricter
+heuristic: the token must be between 8 and 128 characters, contain a letter,
+and also contain a digit or a password-like symbol. This rejects explanatory
+phrases such as `the password is stored` and `the password was changed`.
+
+If a readable Linux mailbox contains password-related wording but no strict
+pattern extracts a reusable value, clean mode emits
+`CREDENTIAL_LEAD/mailbox_review`. This preserves the mailbox as a manual-review
+lead without promoting generic conversation to a HIGH credential finding.
 
 ## Saved Application State and Review Leads
 
@@ -187,7 +234,10 @@ Use `--no-color` / `-NoColor` when redirecting output, pasting results into repo
 In clean mode, `ENCRYPTED_CREDENTIAL_LEAD`, `CREDENTIAL_LEAD`, `REFERENCE`, and `USER_ARTIFACT/...` appear under the visual tag `[LEAD]`:
 
 ```text
+[LEAD] ENCRYPTED_CREDENTIAL_LEAD/encrypted_block  <encrypted-file>
 [LEAD] CREDENTIAL_LEAD/referenced_file  /path/to/config
+[LEAD] CREDENTIAL_LEAD/mailbox_review  /var/mail/<user>
+[LEAD] CREDENTIAL_LEAD/hidden_home_file  /home/<user>/.<name>
 [LEAD] REFERENCE  history -> /path/to/config
 [LEAD] USER_ARTIFACT/app_session  <session-file>
 ```

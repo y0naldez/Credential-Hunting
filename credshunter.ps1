@@ -305,6 +305,13 @@ $script:RawPatterns = @(
        # escaped JSON quote (\") may be part of the password, not its delimiter.
        Regex = '(?im)(^|\\[nrt]|[^A-Za-z_])(password|passwd|passphrase|pwd)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s"#<>{}]){3,}' }
 
+    # Natural-language disclosure in mail, tickets, notes, and chat exports.
+    # A quoted, whitespace-free token avoids prose such as "password is stored".
+    @{ Label = 'prose_password';
+       Regex = '(?i)(?:^|[^A-Za-z_])(?:(?:the|your|my|his|her|their|account|login|new|old|previous|current|default|temporary)\s+)?(?:password|passphrase|pass)\s+(?:is|was|remains?|will\s+be)\s*[:=-]?\s*(?<quote>["''])(?<secret>[^\s"'']{3,128})\k<quote>' }
+    @{ Label = 'prose_password_unquoted';
+       Regex = '(?i)(?:^|[^A-Za-z_])(?:(?:the|your|my|his|her|their|account|login|new|old|previous|current|default|temporary)\s+)?(?:password|passphrase|pass)\s+(?:is|was|remains?|will\s+be)\s*[:=-]?\s+(?<secret>[^\s<>"'']{8,128})' }
+
     # ---- DB / service-prefixed passwords ------------------------------------
     @{ Label = 'db_password';
        Regex = '(?im)(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|cifs)[_-]?(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s"#<>{}]){3,}' }
@@ -675,6 +682,8 @@ function Test-FalsePositive { param([string]$Value)
     # Function-call accessor (getPassword(), get_password(), cfg.getSecret()) --
     # code that fetches a secret at runtime, not a hardcoded literal.
     if ($v -match '^[A-Za-z_][A-Za-z0-9_.]*\(.*\)$')                             { return $true }
+    # JavaScript callback / validator, e.g. `password: function(elem) {`.
+    if ($v -match '^(?i:(?:async\s+)?function\s*\()')                            { return $true }
     # Runtime decryptor call/reference, not a literal password. The decryptor
     # and hardcoded parameters are reported separately as leads.
     if ($lower -match 'decrypt.*\(')                                               { return $true }
@@ -706,6 +715,10 @@ function Test-FalsePositive { param([string]$Value)
     if ($v -match '^vault:v\d+:')                 { return $true }  # HashiCorp Vault
     if ($v -match '^\$ANSIBLE_VAULT;')            { return $true }  # Ansible Vault
     if ($v -match '^pbkdf2_sha\d+\$')             { return $true }  # Django hash
+    # TeamCity generated DSL docs mask protected settings with asterisks; this
+    # is neither plaintext nor recoverable ciphertext.
+    if ($v -match '(?i)^credentialsJSON:\*{3,}$')  { return $true }
+    if ($v -match '(?i)^&lt;[^&]*(password|passwd|passphrase|pwd|secret|token)[^&]*&gt;$') { return $true }
 
     # SQL Server / .NET trusted connection strings have no password to extract
     if ($lower -match 'integrated security=(true|sspi)') { return $true }
@@ -2317,6 +2330,18 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
                 $mq = [regex]::Match($line, '(?i)\bvalue\s*=\s*(?:"(?<secret>[^"]+)"|''(?<secret>[^'']+)'')')
                 if ($mq.Success) { $value = $mq.Groups['secret'].Value }
             }
+            if ($p.Label -eq 'prose_password') {
+                $value = $m.Groups['secret'].Value
+                if ($value -match '(?i)^(stored|encrypted|protected|configured|generated|hidden|masked|redacted|omitted|unchanged|unavailable|required|optional)$') { break }
+            }
+            if ($p.Label -eq 'prose_password_unquoted') {
+                $value = $m.Groups['secret'].Value.TrimEnd('.', ',', ';', ':')
+                if ($value -match '^(?:\$|%.*%$|\{|<)' -or
+                    $value.Length -lt 8 -or
+                    $value -notmatch '[A-Za-z]' -or
+                    ($value -notmatch '[0-9]' -and $value -notmatch '[!@#$%^&*_=+?~-]') -or
+                    $value -match '(?i)^(case-sensitive|not-available|not-disclosed|stored-securely|shown-below|shown-above|configured-below|configured-above)$') { break }
+            }
 
             # -- Hard-coded line-level FP filter (real-host noise) --
             # SQL parameter references / masked passwords / SQL Telemetry
@@ -2331,6 +2356,11 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             if ($line -match 'PASSWORD\s*=\s*''\*+''')                       { break }
             if ($line -match 'SQLTelemetry\s*:\s*Setting')                   { break }
             if ($line -match 'SafeSqlCommand.*PASSWORD\s*=\s*''\*+''')       { break }
+            # Filter HTML-encoded documentation placeholders before the
+            # semicolon-aware value extractor reduces `&lt;...&gt;` to `&lt`.
+            if ($line -match '(?i)(password|passwd|passphrase|pwd)\s*[:=]\s*["'']?&lt;[^&]*(password|passwd|passphrase|pwd|secret|token)[^&]*&gt;') { break }
+            # TeamCity UI field metadata, not assigned credential values.
+            if ($line -match '(?i)^\s*(PWD|PASSWORD)\s*:\s*["'']?(pwdAuth|Password\s*/\s*access\s+token)["'']?,?\s*$') { break }
 
             if (-not ($script:NoFPCheck -contains $p.Label)) {
                 if (Test-FalsePositive -Value $value) { break }
@@ -3621,6 +3651,7 @@ function Test-CleanNoisePath {
         $p -match '/usr/(local/)?lib/ruby/gems/' -or
         $p -match '/vendor/bundle/' -or
         $p -match '/usr/share/doc/' -or
+        $p -match '/[.]buildserver/system/caches/pluginsdslcache/' -or
         $p -match '[.]jar($|[:( ])' -or
         $p -match '/usr/share/[^/]+/lib/.*[.](zip|whl)($|[:( ])' -or
         $p -match '/credshunter[.](sh|ps1)(:|$)') { return $true }
@@ -3676,6 +3707,14 @@ function Test-CleanNoiseInterest { param([object]$Finding)
     if (Test-CleanNoisePath -Path $Finding.Path -IncludePackageCaches) { return $true }
     if ($Finding.Category -ne 'high_value_file') { return $false }
     $p = $Finding.Path.Replace('\','/').ToLowerInvariant()
+    # Installed TeamCity archives are deployable software, not operator
+    # backups. Keep .BuildServer projectConfigs archives visible.
+    if ($p -match '/webapps/root/web-inf/plugins/.*[.](zip|tar|tgz|gz|7z|rar)$' -or
+        $p -match '/webapps/root/(plugins|update)/.*[.](zip|tar|tgz|gz|7z|rar)$' -or
+        $p -match '/webapps/root/web-inf/resources/bundleddsljarsdocs/.*[.](zip|tar|tgz|gz|7z|rar)$' -or
+        $p -match '/teamcity/(bin|devpackage)/.*[.](zip|tar|tgz|gz|7z|rar)$' -or
+        $p -match '^/var/lib/(command-not-found/commands[.]db|fwupd/(pending[.]db|metadata/.*[.]gz)|postfix/smtp_scache[.]db)$' -or
+        $p -match '^/etc/aliases[.]db$' -or $p -match '^/etc/apt/sources[.]list[.]') { return $true }
     if ($p -match '[.](sh|bash|crt|cer|csr|log)$' -or
         $p -match '/etc/(console-setup|init[.]d|profile[.]d)/' -or
         $p -match '/var/backups/(alternatives(?:[.]tar)?|apt[.]extended_states|dpkg[.](diversions|statoverride|status))[.][0-9]+[.]gz$' -or
@@ -3696,7 +3735,16 @@ function Write-CleanSummary {
         -not $localizationCatalogNoise.Contains($_)
     } | Sort-Object Path, LineNumber, Label)
     $highGroups = @($high |
-        Group-Object Label, Path, Preview |
+        # TeamCity logs the same SQL row repeatedly with changing timestamps.
+        # Group hash findings by the reusable hash, not the full log line.
+        Group-Object {
+            $fingerprint = $_.Preview
+            if ($_.Label -match '/shadow_bcrypt$' -and
+                $_.Preview -match '\$2[aby]?\$\d{2}\$[A-Za-z0-9./]{53}') {
+                $fingerprint = $Matches[0]
+            }
+            $_.Label + [char]0x1C + $_.Path + [char]0x1C + $fingerprint
+        } |
         ForEach-Object {
             $first = $_.Group[0]
             $lines = @($_.Group.LineNumber | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
@@ -3852,12 +3900,21 @@ function Write-CleanSummary {
 
     Write-CleanLine ""
     Write-CleanLine "$($script:CBold)$($script:CW)Counts$($script:CNC)"
+    $nHigh = @($high | Group-Object {
+        $fingerprint = $_.Preview
+        if ($_.Label -match '/shadow_bcrypt$' -and
+            $_.Preview -match '\$2[aby]?\$\d{2}\$[A-Za-z0-9./]{53}') {
+            $fingerprint = $Matches[0]
+        }
+        $_.Label + [char]0x1C + $_.Path + [char]0x1C + $fingerprint
+    }).Count
     $suppressed = ($script:HighFindings.Count - $high.Count - $commented.Count) +
                   ($script:KeyFindings.Count - $keys.Count) +
-                  ($script:Interesting.Count - $cleanInteresting.Count)
-    $script:CleanActionableCount = $high.Count + $keys.Count + $script:Guaranteed.Count
+                  ($script:Interesting.Count - $cleanInteresting.Count) +
+                  ($high.Count - $nHigh)
+    $script:CleanActionableCount = $nHigh + $keys.Count + $script:Guaranteed.Count
     Write-CleanLine ("  HIGH: {0}  KEY: {1}  CONTAINERS: {2}  ENCRYPTED_LEADS: {3}  LEADS: {4}  OTHER_INTEREST: {5}  NOISE_SUPPRESSED: {6}  NAME: {7}  SKIPPED: {8}" -f `
-        $high.Count, $keys.Count, $script:Guaranteed.Count,
+        $nHigh, $keys.Count, $script:Guaranteed.Count,
         $encrypted.Count, ($leads.Count + $commented.Count), $other.Count, $suppressed,
         $script:SuspiciousNamesFound.Count, $script:SkippedFiles.Count)
 

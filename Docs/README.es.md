@@ -12,7 +12,7 @@ No intenta autenticarse, no realiza password spraying, no explota servicios, no 
 ## Cómo funciona
 
 ```text
-Stage 1   Sistema y usuarios       registro, servicios, historiales, vaults, sesiones y workspaces
+Stage 1   Sistema y usuarios       registro, servicios, historiales, buzones, archivos ocultos, vaults y sesiones
 Stage 2   Contenedores             kdbx, ppk, pfx, keytab, axx, enc, gpg y archivos renombrados
 Stage 3   Archivos de alto valor   llaves, .env, respaldos, bases de datos, capturas y configs
 Stage 4   Nombres sospechosos      password, secret, credential, backup, vault, etc.
@@ -25,7 +25,7 @@ Stage 1 comprueba ubicaciones conocidas del sistema y aplicaciones. Las etapas 2
 
 | Categoría | Ejemplos |
 |---|---|
-| Credenciales directas | `password=...`, cadenas de conexión, basic auth, comandos e historiales, propiedades SQL y `INSERT` multirregistro correlacionados por columna |
+| Credenciales directas | `password=...`, frases como `the password is "..."` o `the pass was Summer2024`, cadenas de conexión, basic auth, comandos e historiales, propiedades SQL y `INSERT` multirregistro correlacionados por columna |
 | Hallazgos en servicios de Windows | Credenciales hardcodeadas en `ImagePath`, argumentos, URLs o valores de texto bajo `Parameters`; las cuentas de servicio no integradas se conservan como leads para revisión |
 | Material de autenticación | Llaves SSH/PuTTY, PFX/P12, keytabs, SAM/SYSTEM y GPP `cpassword` |
 | Contenedores | KeePass, `.axx`, `.enc`, `.gpg`, `.pgp` y archivos comprimidos renombrados |
@@ -36,11 +36,51 @@ Stage 1 comprueba ubicaciones conocidas del sistema y aplicaciones. Las etapas 2
 
 La búsqueda de tokens cloud/SaaS se limita intencionalmente para evitar ruido. Algunos archivos locales de clientes cloud sí pueden aparecer como artefactos interesantes.
 
+## Cobertura específica de Stage 1
+
+Stage 1 combina patrones de credenciales compartidos con fuentes específicas de
+cada plataforma que requieren un tratamiento dirigido.
+
+### Artefactos locales de Linux
+
+Stage 1 examina los buzones mbox legibles de `/var/mail` y `/var/spool/mail`.
+Los spools enlazados o con hard links se deduplican por la identidad del
+archivo, mientras que los buzones sin permisos se contabilizan como omitidos
+sin interrumpir el análisis.
+
+También analiza el contenido de los archivos ocultos regulares situados
+directamente en cada home. Los nombres inusuales como `.~`, los dotfiles muy
+cortos y los nombres ocultos relacionados con credenciales se conservan como
+`CREDENTIAL_LEAD/hidden_home_file`, incluso cuando su contenido no produce un
+hallazgo HIGH.
+
 ### Servicios de Windows
 
 Stage 1 revisa `ImagePath`, `ObjectName` y los valores de texto de la subclave `Parameters` de cada servicio. Una contraseña literal presente en argumentos, URLs o campos con nombre de credencial se clasifica como `[HIGH]`. Un servicio ejecutado con una cuenta no integrada se presenta como pista para revisión, aunque no exista una contraseña visible.
 
 Las contraseñas configuradas normalmente mediante el Service Control Manager se almacenan como secretos LSA protegidos. CredsHunter no intenta extraerlas y no debe interpretarse una cuenta de servicio como prueba de que su contraseña esté disponible en texto claro.
+
+## Contraseñas en lenguaje natural
+
+Ambos motores reconocen formas comunes de escribir credenciales en notas,
+salidas de comandos y mensajes, por ejemplo:
+
+```text
+The password is "IdealismEngineAshen476"
+The pass was Summer2024
+Password: N3w-Passphrase!
+```
+
+Los valores entre comillas se extraen directamente. Los valores sin comillas
+usan una heurística más estricta: el token debe tener entre 8 y 128 caracteres,
+contener una letra y además un número o un símbolo típico de contraseña. Así se
+descartan explicaciones como `the password is stored` o
+`the password was changed`.
+
+Si un buzón local legible contiene lenguaje relacionado con contraseñas pero
+ningún patrón estricto extrae un valor reutilizable, el modo clean presenta
+`CREDENTIAL_LEAD/mailbox_review`. Así el buzón queda señalado para revisión
+manual sin convertir una conversación genérica en un hallazgo HIGH.
 
 ## Sesiones y archivos que requieren revisión
 
@@ -80,11 +120,15 @@ La contraseña fue el disparador, pero se debe revisar el archivo completo. Cred
 | `[CHECK]` | Ubicación comprobada | Informativo; no indica hallazgo |
 | `[SKIP]` | Archivo omitido por tamaño, binario, permisos o ruido | Ajustar opciones sólo si es relevante |
 
+## Modo limpio
+
 En modo limpio, las categorías de pistas aparecen bajo el tag visual `[LEAD]`:
 
 ```text
 [LEAD] ENCRYPTED_CREDENTIAL_LEAD/encrypted_block  <archivo-cifrado>
 [LEAD] CREDENTIAL_LEAD/referenced_file          /ruta/config
+[LEAD] CREDENTIAL_LEAD/mailbox_review           /var/mail/<usuario>
+[LEAD] CREDENTIAL_LEAD/hidden_home_file         /home/<usuario>/.<nombre>
 [LEAD] REFERENCE                                history -> /ruta/config
 [LEAD] USER_ARTIFACT/app_session                <archivo-de-sesion>
 ```

@@ -529,6 +529,14 @@ CRED_PATTERNS=(
     # Literal JSON \n / \r / \t escapes are credential-key boundaries too.
     'password_assign|(^|\\[nrt]|[^A-Za-z_])(password|passwd|passphrase|pwd)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?([\\]+"|[^[:space:]"#$<>{}]){3,}'
 
+    # Natural-language disclosure in mail, tickets, notes, and chat exports.
+    # Require a quoted, whitespace-free token: this catches `the password is
+    # "Secret123"` while rejecting prose such as `the password is stored in...`.
+    'prose_password|(^|[^A-Za-z_])((the|your|my|his|her|their|account|login|new|old|previous|current|default|temporary)[[:space:]]+)?(password|passphrase|pass)[[:space:]]+(is|was|remains?|will[[:space:]]+be)[[:space:]]*[:=-]?[[:space:]]*['"'"'"][^[:space:]'"'"'"]{3,128}['"'"'"]'
+    # Unquoted prose is noisier, so classification applies additional length
+    # and character-class checks before reporting the captured token.
+    'prose_password_unquoted|(^|[^A-Za-z_])((the|your|my|his|her|their|account|login|new|old|previous|current|default|temporary)[[:space:]]+)?(password|passphrase|pass)[[:space:]]+(is|was|remains?|will[[:space:]]+be)[[:space:]]*[:=-]?[[:space:]]+[^[:space:]<>"'"'"']{8,128}'
+
     # ── DB / service-prefixed passwords ──────────────────────────────────
     'db_password|(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|sftp|cifs)[_-]?(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?([\\]+"|[^[:space:]"#$<>{}]){3,}'
     # Any OTHER identifier ending in _password/_pass/_pwd (covers OpenStack
@@ -639,7 +647,9 @@ CRED_PATTERNS=(
 
     # ── Linux auth files ─────────────────────────────────────────────────
     'htpasswd_hash|^[^:[:space:]#]+:\$(apr1|2[aby]?|5|6|y)\$'
-    'netrc_password|^[[:space:]]*(machine[[:space:]]+\S+[[:space:]]+)?(login|user|username)[[:space:]]+\S+[[:space:]]+password[[:space:]]+\S{2,}'
+    # Keep this faithful to .netrc grammar. Accepting generic user/username
+    # turns UI prose such as "Username / password authentication" into a HIGH.
+    'netrc_password|^[[:space:]]*(machine[[:space:]]+\S+[[:space:]]+)?login[[:space:]]+\S+[[:space:]]+password[[:space:]]+\S{2,}'
     'sudoers_nopasswd|^[[:space:]]*[^#][^[:space:]]*[[:space:]].*NOPASSWD[[:space:]]*[:=]'
     'samba_password|^[[:space:]]*(passwd|password|smb[[:space:]]+passwd)[[:space:]]*=[[:space:]]*[^[:space:]]{3,}'
     # LDAP bind password (OpenLDAP/nslcd/sssd) and IPsec pre-shared key
@@ -811,6 +821,8 @@ is_false_positive() {
     # ── Function-call accessor (getPassword(), get_password(), cfg.getSecret())
     # — code that FETCHES a secret at runtime, not a hardcoded literal.
     [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_.]*\(.*\)$ ]] && return 0
+    # JavaScript callback / validator, e.g. `password: function(elem) {`.
+    [[ "$lower" =~ ^(async[[:space:]]+)?function[[:space:]]*\( ]] && return 0
     # Runtime decryptor call/reference, not a literal password. The decryptor
     # and hardcoded parameters are reported separately as leads.
     [[ "$lower" == *decrypt*"("* ]] && return 0
@@ -848,6 +860,13 @@ is_false_positive() {
         'pbkdf2_sha'*'$'*)  return 0 ;;  # Django password hash format
         # Django-style hashed already
     esac
+
+    # TeamCity generated DSL documentation masks protected settings with
+    # asterisks. This is neither plaintext nor recoverable ciphertext.
+    [[ "$lower" =~ ^credentialsjson:[*]{3,}$ ]] && return 0
+    # HTML-encoded documentation placeholders such as
+    # `&lt;a token representing a password&gt;`.
+    [[ "$lower" =~ ^\&lt\;[^\&]*(password|passwd|passphrase|pwd|secret|token)[^\&]*\&gt\;$ ]] && return 0
 
     # SQL Server / .NET trusted/integrated connection strings have no password
     case "$lower" in
@@ -1466,6 +1485,11 @@ classify_line() {
     # SQL Server Telemetry / Setup-Bootstrap log noise
     [[ "$content" == *SQLTelemetry*Setting* ]] && return 1
     [[ "$content" == *SafeSqlCommand*PASSWORD*\*\*\*\*\*\*\** ]] && return 1
+    # HTML-encoded documentation placeholder. Filter before value extraction,
+    # which intentionally treats semicolons as assignment delimiters.
+    [[ "$content" =~ (password|passwd|passphrase|pwd)[[:space:]]*[:=][[:space:]]*[\"\']?\&lt\;[^\&]*(password|passwd|passphrase|pwd|secret|token)[^\&]*\&gt\; ]] && return 1
+    # TeamCity UI field metadata, not assigned credential values.
+    [[ "$content" =~ ^[[:space:]]*(PWD|PASSWORD)[[:space:]]*:[[:space:]]*[\"\']?(pwdAuth|Password[[:space:]]*/[[:space:]]*access[[:space:]]+token)[\"\']?,?[[:space:]]*$ ]] && return 1
     # /etc/nsswitch.conf uses `passwd: files systemd` to select account
     # databases.  It is routing syntax, not a password assignment.
     if [ "${file##*/}" = "nsswitch.conf" ] && [[ "$content" =~ ^[[:space:]]*passwd:[[:space:]] ]]; then
@@ -1480,6 +1504,14 @@ classify_line() {
             # Save this immediately: later regex helpers overwrite BASH_REMATCH.
             matched_text="${BASH_REMATCH[0]}"
             encrypted_secret_value_line "$content" && return 1
+            # nocasematch is enabled for the shared pattern library, but an
+            # environment variable must actually be uppercase. Revalidate this
+            # one pattern case-sensitively so camelCase UI fields such as
+            # `prefillPassword` are not treated as environment credentials.
+            if [ "$label" = "env_password" ] &&
+               ! LC_ALL=C grep -qE '(^|[[:space:]])(set[[:space:]]+|export[[:space:]]+|setx[[:space:]]+)?[A-Z][A-Z0-9_]*(PASSWORD|PASSWD|PASSPHRASE)[A-Z0-9_]*[[:space:]]*=' <<<"$content"; then
+                return 1
+            fi
             # NOPASSWD is actionable only when it comes from an active sudoers
             # policy.  Broad scans also encounter cloud-init templates such as
             # /etc/cloud/cloud.cfg; those are not themselves enforced policy.
@@ -1528,6 +1560,31 @@ classify_line() {
             # last quoted literal on the line as the value before FP-filtering
             # (e.g.  'password' => 'changeme'  ->  changeme).
             case "$label" in
+                prose_password)
+                    if [[ "$matched_text" =~ [\'\"]([^[:space:]\'\"]{3,128})[\'\"] ]]; then
+                        value="${BASH_REMATCH[1]}"
+                    fi
+                    # Documentation commonly describes where/how a password
+                    # is stored using one quoted predicate word.
+                    case "${value,,}" in
+                        stored|encrypted|protected|configured|generated|hidden|masked|redacted|omitted|unchanged|unavailable|required|optional) return 1 ;;
+                    esac
+                    ;;
+                prose_password_unquoted)
+                    value="${matched_text##*[[:space:]]}"
+                    # Remove ordinary sentence punctuation, not password-strong
+                    # suffixes such as !, ?, #, @, +, or =.
+                    while [[ "$value" == *[.,\;:] ]]; do value="${value%?}"; done
+                    case "$value" in
+                        \$*|%*%|\{*|\<*) return 1 ;;
+                    esac
+                    [ "${#value}" -ge 8 ] || return 1
+                    [[ "$value" =~ [A-Za-z] ]] || return 1
+                    [[ "$value" =~ [0-9] || "$value" =~ [\!@#\$%\^\&\*_=+?~-] ]] || return 1
+                    case "${value,,}" in
+                        case-sensitive|not-available|not-disclosed|stored-securely|shown-below|shown-above|configured-below|configured-above) return 1 ;;
+                    esac
+                    ;;
                 drupal_password|php_array_secret|wp_db_password)
                     if [[ "$content" =~ .*[\'\"]([^\'\"]+)[\'\"][^\'\"]*$ ]]; then
                         value="${BASH_REMATCH[1]}"
@@ -2038,7 +2095,7 @@ check_web_apps() {
 
 check_home_dotfiles() {
     info "Stage 1.8 — high-value dotfiles in home dirs"
-    local f
+    local f home bn lower
     while IFS= read -r -d '' f; do
         case "$f" in
             # FileZilla stores <Pass encoding="base64">…</Pass> which the
@@ -2056,6 +2113,40 @@ check_home_dotfiles() {
         -o -path '*/.config/filezilla/recentservers.xml' \
         -o -path '*/.config/filezilla/filezilla.xml' \
         \) -print0 2>/dev/null)
+
+    # Inspect every regular hidden file directly inside a user's home. This
+    # catches arbitrary names with no extension (for example `.~`) that the
+    # Stage-5 allow-list cannot select. Only unusual names become leads; normal
+    # dotfiles are content-scanned quietly and de-duplicated against the
+    # targeted checks above by scan_file's canonical-path guard.
+    local home_spec="${CREDSHUNTER_HOME_DIRS:-}"
+    local homes=()
+    if [ -n "$home_spec" ]; then
+        IFS=':' read -r -a homes <<<"$home_spec"
+    else
+        [ -d /root ] && homes+=(/root)
+        while IFS= read -r -d '' home; do homes+=("$home")
+        done < <(find /home -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    fi
+    for home in "${homes[@]}"; do
+        [ -d "$home" ] || continue
+        while IFS= read -r -d '' f; do
+            bn="${f##*/}"
+            lower="${bn,,}"
+            record_checked "hidden_home_file" "$f"
+            case "$bn" in
+                .|..) continue ;;
+            esac
+            if [[ "$bn" =~ ^\.[^A-Za-z0-9_] ]] || [ "${#bn}" -le 3 ] ||
+               [[ "$lower" == *password* || "$lower" == *passwd* ||
+                  "$lower" == *secret* || "$lower" == *credential* ||
+                  "$lower" == *vault* ]]; then
+                record_interest "CREDENTIAL_LEAD/hidden_home_file" \
+                    "$f (unusual top-level hidden file; review complete content)"
+            fi
+            scan_file "$f" "hidden_home"
+        done < <(find -L "$home" -mindepth 1 -maxdepth 1 -type f -name '.*' -print0 2>/dev/null)
+    done
 
     # gcloud CLI credential stores (sqlite DB + ADC json). The DBs are binary,
     # so flag for manual review; the JSON ADC files are also content-scanned.
@@ -2126,9 +2217,54 @@ check_wifi() {
     done
 }
 
+# Scan traditional local mbox spools. /var/spool/mail is commonly a symlink to
+# /var/mail; device+inode identity avoids duplicate reads even for hard links
+# or bind-mounted aliases. Tests/chroots may override the colon-separated roots
+# through CREDSHUNTER_MAIL_SPOOL_DIRS.
+scan_local_mailboxes() {
+    local roots_spec="${CREDSHUNTER_MAIL_SPOOL_DIRS:-/var/mail:/var/spool/mail}"
+    local roots=() root f identity canonical high_before high_after sz
+    IFS=':' read -r -a roots <<<"$roots_spec"
+    declare -A seen_mailboxes=()
+
+    for root in "${roots[@]}"; do
+        [ -e "$root" ] || continue
+        while IFS= read -r -d '' f; do
+            identity=$(stat -Lc '%d:%i' -- "$f" 2>/dev/null || true)
+            if [ -z "$identity" ]; then
+                canonical=$(readlink -f -- "$f" 2>/dev/null || printf '%s' "$f")
+                identity="path:$canonical"
+            fi
+            [ -n "${seen_mailboxes["$identity"]:-}" ] && continue
+            seen_mailboxes["$identity"]=1
+            record_checked "local_mailbox" "$f"
+            # scan_file records unreadable/oversized/binary mailbox files in
+            # the normal skipped-file ledger rather than failing the stage.
+            high_before=$(wc -l <"$HIGH_FILE" 2>/dev/null | tr -d ' ' || echo 0)
+            scan_file "$f" "mailbox"
+            high_after=$(wc -l <"$HIGH_FILE" 2>/dev/null | tr -d ' ' || echo 0)
+
+            # Safety net for prose variants outside the deliberately strict
+            # HIGH patterns. Only readable, text-sized mailboxes qualify, and
+            # only when this mailbox produced no reusable credential finding.
+            # The lead asks for manual review without changing the exit code.
+            if [ "$high_after" -eq "$high_before" ] && [ -r "$f" ]; then
+                sz=$(file_size "$f")
+                if [ "$sz" -gt 0 ] &&
+                   { [ "$SKIP_LARGE" -eq 0 ] || [ "$sz" -le $((MAX_FILE_SIZE_MB * 1024 * 1024)) ]; } &&
+                   LC_ALL=C grep -aIiqE '(^|[^[:alnum:]_])(password|passwd|passphrase)([^[:alnum:]_]|$)|(^|[^[:alnum:]_])pass[[:space:]]+(is|was|remains?|will[[:space:]]+be)([^[:alnum:]_]|$)' -- "$f" 2>/dev/null; then
+                    record_interest "CREDENTIAL_LEAD/mailbox_review" \
+                        "$f (password wording found but no reusable value matched; review mailbox manually)"
+                fi
+            fi
+        done < <(find -L "$root" -maxdepth 1 -type f -print0 2>/dev/null)
+    done
+}
+
 check_misc_services() {
     info "Stage 1.11 — VPN / mail / Kerberos / Samba / FTP / proxy / monitoring / CI configs"
     local f
+    scan_local_mailboxes
     for f in /etc/openvpn/auth.txt /etc/openvpn/credentials \
              /etc/openvpn/server.conf /etc/openvpn/client.conf \
              /etc/wireguard/*.conf /etc/strongswan.conf \
@@ -2748,7 +2884,18 @@ print_clean_tsv_findings() {
     if [ "$group_repeats" -eq 1 ]; then
         while IFS= read -r rendered || [ -n "$rendered" ]; do
             clean_line "$rendered"
-        done < <(sort -u "$file" | sort -t $'\t' -k1,1 -k2,2 -k4,4 -k3,3n |
+        done < <(sort -u "$file" |
+            awk -F'\t' 'BEGIN { OFS="\t" }
+                {
+                    fingerprint=$4
+                    if ($1 ~ /\/shadow_bcrypt$/ &&
+                        match($4, /[$]2[aby]?[$][0-9][0-9][$][A-Za-z0-9.\/]+/)) {
+                        candidate=substr($4, RSTART, RLENGTH)
+                        if (length(candidate) >= 59) fingerprint=substr(candidate, 1, 60)
+                    }
+                    print $0, fingerprint
+                }' |
+            sort -t $'\t' -k1,1 -k2,2 -k5,5 -k3,3n |
             awk -F'\t' -v tag="$tag" -v color="$color" -v nc="$NC" -v dim="$D" '
                 function emit( location) {
                     if (count > 1) location = "lines " lines " (" count " occurrences)"
@@ -2757,7 +2904,7 @@ print_clean_tsv_findings() {
                     if (preview != "") printf "         %s%s%s\n", dim, preview, nc
                 }
                 {
-                    key = $1 "\034" $2 "\034" $4
+                    key = $1 "\034" $2 "\034" $5
                     if (NR > 1 && key != previous) emit()
                     if (key != previous) {
                         label = $1; path = $2; preview = $4; lines = $3; count = 1; previous = key
@@ -2894,6 +3041,7 @@ prepare_clean_high() {
                    q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                    q ~ /\/vendor\/bundle\// ||
                    q ~ /\/usr\/share\/doc\// ||
+                   q ~ /\/[.]buildserver\/system\/caches\/pluginsdslcache\// ||
                    q ~ /[.]jar$/ ||
                    q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)$/ ||
@@ -2928,6 +3076,7 @@ prepare_clean_commented() {
                    q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                    q ~ /\/vendor\/bundle\// ||
                    q ~ /\/usr\/share\/doc\// ||
+                   q ~ /\/[.]buildserver\/system\/caches\/pluginsdslcache\// ||
                    q ~ /[.]jar$/ ||
                    q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)$/
@@ -2975,12 +3124,22 @@ prepare_clean_interest() {
                 q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                 q ~ /\/vendor\/bundle\// ||
                 q ~ /\/usr\/share\/doc\// ||
+                q ~ /\/[.]buildserver\/system\/caches\/pluginsdslcache\// ||
                 q ~ /[.]jar$/ ||
                 q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
                 q ~ /\/credshunter[.](sh|ps1)(:|$)/ ||
                 q ~ /^\/etc\/apt\/trusted[.]gpg([.]d\/|$)/ ||
                 q ~ /^\/usr\/share\/keyrings\//) return 1
             if (cat != "high_value_file") return 0
+            # Installed TeamCity archives are deployable software, not
+            # operator backups. Keep .BuildServer projectConfigs archives:
+            # those may contain recoverable project settings.
+            if (q ~ /\/webapps\/root\/web-inf\/plugins\/.*[.](zip|tar|tgz|gz|7z|rar)$/ ||
+                q ~ /\/webapps\/root\/(plugins|update)\/.*[.](zip|tar|tgz|gz|7z|rar)$/ ||
+                q ~ /\/webapps\/root\/web-inf\/resources\/bundleddsljarsdocs\/.*[.](zip|tar|tgz|gz|7z|rar)$/ ||
+                q ~ /\/teamcity\/(bin|devpackage)\/.*[.](zip|tar|tgz|gz|7z|rar)$/) return 1
+            if (q ~ /^\/var\/lib\/(command-not-found\/commands[.]db|fwupd\/(pending[.]db|metadata\/.*[.]gz)|postfix\/smtp_scache[.]db)$/) return 1
+            if (q ~ /^\/etc\/aliases[.]db$/ || q ~ /^\/etc\/apt\/sources[.]list[.]/) return 1
             if (q ~ /[.](sh|bash|crt|cer|csr|log)$/ ||
                 q ~ /\/etc\/(console-setup|init[.]d|profile[.]d)\// ||
                 q ~ /\/var\/backups\/(alternatives([.]tar)?|apt[.]extended_states|dpkg[.](diversions|statoverride|status))[.][0-9]+[.]gz$/ ||
@@ -3030,7 +3189,18 @@ print_clean_summary() {
 
     local n_guar n_high n_commented n_key n_int n_name n_skip n_enc n_leads n_other
     n_guar=$( [ -s "$GUARANTEED_FILE" ] && sort -u "$GUARANTEED_FILE" | wc -l | tr -d ' ' || echo 0)
-    n_high=$( [ -s "$clean_high" ] && wc -l <"$clean_high" | tr -d ' ' || echo 0)
+    n_high=$(if [ -s "$clean_high" ]; then
+        awk -F'\t' '
+            {
+                fingerprint=$4
+                if ($1 ~ /\/shadow_bcrypt$/ &&
+                    match($4, /[$]2[aby]?[$][0-9][0-9][$][A-Za-z0-9.\/]+/)) {
+                    candidate=substr($4, RSTART, RLENGTH)
+                    if (length(candidate) >= 59) fingerprint=substr(candidate, 1, 60)
+                }
+                print $1 "\034" $2 "\034" fingerprint
+            }' "$clean_high" | sort -u | wc -l | tr -d ' '
+    else echo 0; fi)
     n_commented=$( [ -s "$clean_commented" ] && wc -l <"$clean_commented" | tr -d ' ' || echo 0)
     n_key=$( [ -s "$clean_keys" ] && wc -l <"$clean_keys" | tr -d ' ' || echo 0)
     n_int=$( [ -s "$clean_interest" ] && wc -l <"$clean_interest" | tr -d ' ' || echo 0)
