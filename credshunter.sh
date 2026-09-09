@@ -1512,6 +1512,14 @@ classify_line() {
                ! LC_ALL=C grep -qE '(^|[[:space:]])(set[[:space:]]+|export[[:space:]]+|setx[[:space:]]+)?[A-Z][A-Z0-9_]*(PASSWORD|PASSWD|PASSPHRASE)[A-Z0-9_]*[[:space:]]*=' <<<"$content"; then
                 return 1
             fi
+            # sudo/syslog records expose the process working directory as
+            # uppercase PWD=/path. It is not a password and must not count as a
+            # mailbox credential (or suppress the mailbox-review safety net).
+            if [ "$label" = "password_assign" ] &&
+               [[ "$matched_text" =~ (^|[^A-Za-z_])PWD[[:space:]]*=[[:space:]]*/ ]] &&
+               [[ "$content" =~ TTY=.+PWD=/.+USER=.+COMMAND= ]]; then
+                return 1
+            fi
             # NOPASSWD is actionable only when it comes from an active sudoers
             # policy.  Broad scans also encounter cloud-init templates such as
             # /etc/cloud/cloud.cfg; those are not themselves enforced policy.
@@ -2217,13 +2225,67 @@ check_wifi() {
     done
 }
 
+# Mail often separates the disclosure from the value, for example:
+#
+#   Here are the credentials for the root user:
+#   root:CorrectHorseBattery9!
+#
+# The shared line-oriented patterns deliberately do not accept a bare
+# `user:secret` pair because that shape is far too broad for a filesystem scan.
+# Correlate it only inside a mailbox and only within a short window after an
+# explicit credential-disclosure phrase.  Output from awk is line<TAB>value so
+# the finding points at the actual credential rather than at the prose anchor.
+scan_mailbox_context_credentials() {
+    local file="$1" lineno candidate secret found=1 sz
+    [ -r "$file" ] || return 1
+    sz=$(file_size "$file")
+    [ "$sz" -gt 0 ] || return 1
+    if [ "$SKIP_LARGE" -eq 1 ] && [ "$sz" -gt $((MAX_FILE_SIZE_MB * 1024 * 1024)) ]; then
+        return 1
+    fi
+    is_binary "$file" && return 1
+
+    while IFS=$'\t' read -r lineno candidate || [ -n "$candidate" ]; do
+        [ -n "$lineno" ] && [ -n "$candidate" ] || continue
+        secret="${candidate#*:}"
+        is_false_positive "$secret" && continue
+        record_finding HIGH "mailbox/contextual_user_password" "$file" "$lineno" \
+            "$(sanitize "$candidate")"
+        found=0
+    done < <(LC_ALL=C awk '
+        function disclosure(s, l) {
+            l=tolower(s)
+            return l ~ /(credentials?|login[[:space:]]+(details?|information)|access[[:space:]]+(details?|information)|username[[:space:]]*(and|\/)[[:space:]]*password|credenciales|datos[[:space:]]+de[[:space:]]+acceso)/
+        }
+        function header_name(u, l) {
+            l=tolower(u)
+            return l ~ /^(from|to|cc|bcc|subject|date|reply-to|return-path|envelope-to|delivery-date|received|message-id|references|content-type|mime-version|x-failed-recipients|auto-submitted)$/
+        }
+        {
+            sub(/\r$/, "", $0)
+            if (disclosure($0)) remaining=6
+            if (remaining > 0 && match($0, /^[[:space:]]*[A-Za-z_][A-Za-z0-9._@\\-]{0,63}:[^[:space:]:]{6,128}[[:space:]]*$/)) {
+                v=substr($0, RSTART, RLENGTH)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+                split(v, p, ":")
+                secret=substr(v, index(v, ":") + 1)
+                if (!header_name(p[1]) && secret ~ /[A-Za-z]/ && (secret ~ /[0-9]/ || secret ~ /[^A-Za-z0-9]/))
+                    print NR "\t" v
+            }
+            if (remaining > 0) remaining--
+        }
+    ' "$file" 2>/dev/null)
+
+    return "$found"
+}
+
 # Scan traditional local mbox spools. /var/spool/mail is commonly a symlink to
 # /var/mail; device+inode identity avoids duplicate reads even for hard links
 # or bind-mounted aliases. Tests/chroots may override the colon-separated roots
 # through CREDSHUNTER_MAIL_SPOOL_DIRS.
 scan_local_mailboxes() {
     local roots_spec="${CREDSHUNTER_MAIL_SPOOL_DIRS:-/var/mail:/var/spool/mail}"
-    local roots=() root f identity canonical high_before high_after sz
+    local roots=() root f identity canonical sz
     IFS=':' read -r -a roots <<<"$roots_spec"
     declare -A seen_mailboxes=()
 
@@ -2240,21 +2302,20 @@ scan_local_mailboxes() {
             record_checked "local_mailbox" "$f"
             # scan_file records unreadable/oversized/binary mailbox files in
             # the normal skipped-file ledger rather than failing the stage.
-            high_before=$(wc -l <"$HIGH_FILE" 2>/dev/null | tr -d ' ' || echo 0)
             scan_file "$f" "mailbox"
-            high_after=$(wc -l <"$HIGH_FILE" 2>/dev/null | tr -d ' ' || echo 0)
+            scan_mailbox_context_credentials "$f" || true
 
-            # Safety net for prose variants outside the deliberately strict
-            # HIGH patterns. Only readable, text-sized mailboxes qualify, and
-            # only when this mailbox produced no reusable credential finding.
-            # The lead asks for manual review without changing the exit code.
-            if [ "$high_after" -eq "$high_before" ] && [ -r "$f" ]; then
+            # Mail is free-form and may express credentials in ways no finite
+            # pattern library covers. Every readable, non-empty text mailbox is
+            # therefore retained for full manual review even when HIGH findings
+            # were extracted from it. The lead does not change the exit code.
+            if [ -r "$f" ]; then
                 sz=$(file_size "$f")
                 if [ "$sz" -gt 0 ] &&
                    { [ "$SKIP_LARGE" -eq 0 ] || [ "$sz" -le $((MAX_FILE_SIZE_MB * 1024 * 1024)) ]; } &&
-                   LC_ALL=C grep -aIiqE '(^|[^[:alnum:]_])(password|passwd|passphrase)([^[:alnum:]_]|$)|(^|[^[:alnum:]_])pass[[:space:]]+(is|was|remains?|will[[:space:]]+be)([^[:alnum:]_]|$)' -- "$f" 2>/dev/null; then
+                   ! is_binary "$f"; then
                     record_interest "CREDENTIAL_LEAD/mailbox_review" \
-                        "$f (password wording found but no reusable value matched; review mailbox manually)"
+                        "$f (local mailbox; review the entire file manually because additional credentials may use unrecognized wording or formats)"
                 fi
             fi
         done < <(find -L "$root" -maxdepth 1 -type f -print0 2>/dev/null)
@@ -3031,6 +3092,11 @@ prepare_clean_high() {
             sub(/[\047\042].*$/, "", key)
             dir=q
             sub(/\/[^\/]*$/, "", dir)
+            # Common layouts insert a locale directory between the catalog
+            # root and filename: lang/en/admin.php, lang/de/admin.php, etc.
+            # Group across those locale siblings, not inside each locale.
+            if (dir ~ /\/(languages?|lang|locales?|i18n|l10n|translations?)\/[^\/]+$/)
+                sub(/\/[^\/]+$/, "", dir)
             return dir "\034" tolower(key)
         }
         function noisy(p, preview, q, r) {
@@ -3060,7 +3126,10 @@ prepare_clean_high() {
         }
         {
             cluster=catalog_cluster($1, $2, $4)
-            if (cluster != "" && files[cluster] >= 3 && values[cluster] >= 2) next
+            # PluXml-style localization message IDs use an explicit L_ prefix;
+            # those are labels even when a key exists in only one locale.
+            if (cluster != "" && (index(cluster, "\034l_") > 0 ||
+                                  (files[cluster] >= 3 && values[cluster] >= 2))) next
             if (!noisy($2, $4)) print
         }
     ' "$HIGH_FILE" "$HIGH_FILE" | sort -u >"$out"

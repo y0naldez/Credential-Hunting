@@ -3679,13 +3679,24 @@ function Get-CleanLocalizationCatalogNoise {
     # such as `ftp_login_pass`, but their values are UI labels rather than
     # secrets.  Suppress a cluster only when the same PHP-array key occurs in
     # at least three sibling catalog files with at least two distinct rendered
+    $directNoise = [System.Collections.Generic.List[object]]::new()
     $rows = foreach ($finding in $Findings) {
         if ($finding.Label -notmatch '(?:^|/)php_array_secret$') { continue }
         $normalizedPath = $finding.Path.Replace('\','/').ToLowerInvariant()
         if ($normalizedPath -notmatch '(?:^|/)(?:languages?|lang|locales?|i18n|l10n|translations?)/') { continue }
         $match = [regex]::Match($finding.Preview, '^\s*(?<quote>[''"])(?<key>[^''"]+)\k<quote>\s*=>\s*[''"]')
         if (-not $match.Success) { continue }
+        if ($match.Groups['key'].Value -match '^(?i)L_') {
+            $directNoise.Add($finding)
+            continue
+        }
         $directory = $normalizedPath -replace '/[^/]+$', ''
+        # Group lang/en/admin.php, lang/de/admin.php, etc. at the shared
+        # localization root. Grouping inside each locale never reaches the
+        # three-file threshold and leaves every translated UI label visible.
+        if ($directory -match '^(?<root>.*?/(?:languages?|lang|locales?|i18n|l10n|translations?))/[^/]+$') {
+            $directory = $Matches['root']
+        }
         [PSCustomObject]@{
             Finding = $finding
             Cluster = $directory + [char]0x1C + $match.Groups['key'].Value.ToLowerInvariant()
@@ -3693,6 +3704,7 @@ function Get-CleanLocalizationCatalogNoise {
     }
 
     $noise = [System.Collections.Generic.List[object]]::new()
+    foreach ($finding in $directNoise) { $noise.Add($finding) }
     foreach ($group in @($rows | Group-Object Cluster)) {
         $distinctFiles = @($group.Group.Finding.Path | Sort-Object -Unique).Count
         $distinctValues = @($group.Group.Finding.Preview | Sort-Object -Unique).Count

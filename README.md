@@ -59,7 +59,7 @@ benefit from targeted handling.
 
 Stage 1 scans readable local mbox files in `/var/mail` and `/var/spool/mail`.
 Aliased spools and hard links are deduplicated by file identity, while
-unreadable mailboxes are counted as skipped without stopping the hunt.
+unreadable mailboxes are counted as skipped without stopping the hunt..
 
 It also content-scans regular hidden files located directly inside each home
 directory. Unusual names such as `.~`, very short dotfile names, and hidden
@@ -94,10 +94,12 @@ heuristic: the token must be between 8 and 128 characters, contain a letter,
 and also contain a digit or a password-like symbol. This rejects explanatory
 phrases such as `the password is stored` and `the password was changed`.
 
-If a readable Linux mailbox contains password-related wording but no strict
-pattern extracts a reusable value, clean mode emits
-`CREDENTIAL_LEAD/mailbox_review`. This preserves the mailbox as a manual-review
-lead without promoting generic conversation to a HIGH credential finding.
+Every readable, non-empty Linux mailbox is also emitted as
+`CREDENTIAL_LEAD/mailbox_review`, even when strict or contextual patterns have
+already produced HIGH findings. Mail is free-form, so operators should review
+the entire mailbox for additional credentials whose wording or format is not
+recognized. The review lead itself does not promote generic conversation to a
+HIGH finding or change the exit code.
 
 ## Saved Application State and Review Leads
 
