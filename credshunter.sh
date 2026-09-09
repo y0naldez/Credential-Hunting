@@ -2233,10 +2233,13 @@ check_wifi() {
 # The shared line-oriented patterns deliberately do not accept a bare
 # `user:secret` pair because that shape is far too broad for a filesystem scan.
 # Correlate it only inside a mailbox and only within a short window after an
-# explicit credential-disclosure phrase.  Output from awk is line<TAB>value so
-# the finding points at the actual credential rather than at the prose anchor.
+# explicit credential-disclosure phrase. Keep this parser in Bash rather than
+# awk: older awk implementations do not consistently support interval regexes.
 scan_mailbox_context_credentials() {
-    local file="$1" lineno candidate secret found=1 sz
+    local file="$1" line="" lineno=0 candidate username secret lower_username
+    local found=1 sz remaining=0
+    local disclosure_regex='(credentials?|login[[:space:]]+(details?|information)|access[[:space:]]+(details?|information)|username[[:space:]]*(and|/)[[:space:]]*password|credenciales|datos[[:space:]]+de[[:space:]]+acceso)'
+    local pair_regex='^[[:space:]]*([A-Za-z_][A-Za-z0-9._@-]*):([^[:space:]:]+)[[:space:]]*$'
     [ -r "$file" ] || return 1
     sz=$(file_size "$file")
     [ "$sz" -gt 0 ] || return 1
@@ -2245,36 +2248,34 @@ scan_mailbox_context_credentials() {
     fi
     is_binary "$file" && return 1
 
-    while IFS=$'\t' read -r lineno candidate || [ -n "$candidate" ]; do
-        [ -n "$lineno" ] && [ -n "$candidate" ] || continue
-        secret="${candidate#*:}"
-        is_false_positive "$secret" && continue
-        record_finding HIGH "mailbox/contextual_user_password" "$file" "$lineno" \
-            "$(sanitize "$candidate")"
-        found=0
-    done < <(LC_ALL=C awk '
-        function disclosure(s, l) {
-            l=tolower(s)
-            return l ~ /(credentials?|login[[:space:]]+(details?|information)|access[[:space:]]+(details?|information)|username[[:space:]]*(and|\/)[[:space:]]*password|credenciales|datos[[:space:]]+de[[:space:]]+acceso)/
-        }
-        function header_name(u, l) {
-            l=tolower(u)
-            return l ~ /^(from|to|cc|bcc|subject|date|reply-to|return-path|envelope-to|delivery-date|received|message-id|references|content-type|mime-version|x-failed-recipients|auto-submitted)$/
-        }
-        {
-            sub(/\r$/, "", $0)
-            if (disclosure($0)) remaining=6
-            if (remaining > 0 && match($0, /^[[:space:]]*[A-Za-z_][A-Za-z0-9._@\\-]{0,63}:[^[:space:]:]{6,128}[[:space:]]*$/)) {
-                v=substr($0, RSTART, RLENGTH)
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
-                split(v, p, ":")
-                secret=substr(v, index(v, ":") + 1)
-                if (!header_name(p[1]) && secret ~ /[A-Za-z]/ && (secret ~ /[0-9]/ || secret ~ /[^A-Za-z0-9]/))
-                    print NR "\t" v
-            }
-            if (remaining > 0) remaining--
-        }
-    ' "$file" 2>/dev/null)
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        line="${line%$'\r'}"
+        [[ "$line" =~ $disclosure_regex ]] && remaining=6
+
+        if [ "$remaining" -gt 0 ] && [[ "$line" =~ $pair_regex ]]; then
+            username="${BASH_REMATCH[1]}"
+            secret="${BASH_REMATCH[2]}"
+            lower_username="${username,,}"
+            case "$lower_username" in
+                from|to|cc|bcc|subject|date|reply-to|return-path|envelope-to|delivery-date|received|message-id|references|content-type|mime-version|x-failed-recipients|auto-submitted)
+                    ;;
+                *)
+                    if [ "${#username}" -le 64 ] &&
+                       [ "${#secret}" -ge 6 ] && [ "${#secret}" -le 128 ] &&
+                       [[ "$secret" =~ [A-Za-z] ]] &&
+                       { [[ "$secret" =~ [0-9] ]] || [[ "$secret" =~ [^A-Za-z0-9] ]]; } &&
+                       ! is_false_positive "$secret"; then
+                        candidate="$username:$secret"
+                        record_finding HIGH "mailbox/contextual_user_password" "$file" "$lineno" \
+                            "$(sanitize "$candidate")"
+                        found=0
+                    fi
+                    ;;
+            esac
+        fi
+        [ "$remaining" -gt 0 ] && remaining=$((remaining - 1))
+    done <"$file"
 
     return "$found"
 }
