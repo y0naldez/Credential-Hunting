@@ -191,6 +191,12 @@ language files. Isolated values remain visible. `NOISE_SUPPRESSED` reports how
 many raw items were omitted from that view. Full mode retains those raw matches
 for exhaustive review.
 
+Generic installed scripts remain suppressed in clean mode, but backup scripts
+do not. Shell scripts located in backup directories or named with markers such
+as `backup`, `dump`, `archive`, `snapshot`, `export`, or `sync` are retained as
+`[INTEREST] backup_script`, even when no credential pattern matches their
+content. This includes paths such as `/var/backups/etc_Backup.sh`.
+
 Explicit encrypted formats such as `.axx` remain encrypted credential leads.
 Generic backup archives such as `.zip` remain lower-priority interesting files.
 Known ZIP-based formats, including software packages such as `.jar`, `.war`,

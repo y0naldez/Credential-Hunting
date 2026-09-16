@@ -2626,6 +2626,15 @@ find_guaranteed_credentials() {
 #
 # Files already flagged by Stage 2 (guaranteed credential containers) are
 # deduped against $GUARANTEED_FILE so e.g. *.keytab doesn't double-emit.
+is_backup_script() {
+    local file="${1,,}" bn="${1##*/}"
+    bn="${bn,,}"
+    case "$file" in
+        /var/backups/*|var/backups/*|*/var/backups/*|backup/*|backups/*|*/backup/*|*/backups/*) return 0 ;;
+    esac
+    [[ "$bn" =~ (^|[._-])(backup|backups|bak|dump|archive|snapshot|export|sync)([._-]|$) ]]
+}
+
 find_high_value_files() {
     build_find_excludes
     local path
@@ -2670,6 +2679,12 @@ find_high_value_files() {
             case "${ext,,}" in
                 pem|key|priv)
                     if record_private_key_if_present "$f"; then continue; fi
+                    ;;
+                sh|bash)
+                    if is_backup_script "$f"; then
+                        record_interest "backup_script" "$f"
+                        continue
+                    fi
                     ;;
             esac
             # A public certificate in a .pem file is not authentication material.

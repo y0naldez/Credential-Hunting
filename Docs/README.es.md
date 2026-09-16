@@ -157,6 +157,13 @@ idioma del mismo directorio; los valores aislados siguen visibles. `NOISE_SUPPRE
 indica cuántos elementos crudos se ocultaron.
 El modo completo los conserva para una revisión exhaustiva.
 
+Los scripts genéricos instalados continúan filtrándose en modo limpio, pero los
+scripts de respaldo no. Un script de shell ubicado en un directorio de backups
+o cuyo nombre contenga indicadores como `backup`, `dump`, `archive`,
+`snapshot`, `export` o `sync` se conserva como `[INTEREST] backup_script`,
+aunque su contenido no coincida con ningún patrón. Esto incluye rutas como
+`/var/backups/etc_Backup.sh`.
+
 Los formatos cifrados explícitos como `.axx` se conservan como pistas de
 credenciales cifradas. Los respaldos genéricos como `.zip` quedan como archivos
 interesantes de menor prioridad. Los formatos conocidos basados en ZIP,
