@@ -1952,24 +1952,50 @@ check_known_file() {
 
 check_shell_histories() {
     info "Stage 1.1 — shell / tool history files"
-    local f histfiles=(
-        /root/.bash_history /root/.zsh_history /root/.sh_history /root/.ash_history
-        /root/.history /root/.lesshst /root/.viminfo
-        /root/.mysql_history /root/.psql_history /root/.sqlite_history
-        /root/.python_history /root/.node_repl_history /root/.rediscli_history
-        /root/.irb_history
-    )
-    while IFS= read -r -d '' f; do histfiles+=("$f"); done < <(
-        find /home -maxdepth 3 \( \
+    local f home account home_spec="${CREDSHUNTER_HOME_DIRS:-}" homes=() histfiles=()
+
+    if [ -n "$home_spec" ]; then
+        IFS=':' read -r -a homes <<<"$home_spec"
+    else
+        [ -d /root ] && homes+=(/root)
+        while IFS= read -r -d '' home; do homes+=("$home")
+        done < <(find /home -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    fi
+
+    # Enumerating each account home is the NUL-safe equivalent of commands
+    # such as `cat /home/*/.bash_history`, while also covering other common
+    # shells and interactive tools. Tests/chroots can provide a colon-separated
+    # home list through CREDSHUNTER_HOME_DIRS.
+    for home in "${homes[@]}"; do
+        [ -d "$home" ] || continue
+        while IFS= read -r -d '' f; do histfiles+=("$f"); done < <(
+            find -L "$home" -maxdepth 2 \( \
             -name '.bash_history' -o -name '.zsh_history' -o -name '.sh_history' \
-            -o -name '.ash_history' -o -name '.history' -o -name '.lesshst' \
+            -o -name '.ksh_history' -o -name '.ash_history' -o -name '.history' \
+            -o -name '.lesshst' \
             -o -name '.mysql_history' -o -name '.psql_history' \
             -o -name '.sqlite_history' -o -name '.python_history' \
             -o -name '.node_repl_history' -o -name '.rediscli_history' \
             -o -name '.irb_history' -o -name '.viminfo' \
             \) -type f -print0 2>/dev/null)
+    done
+
     for f in "${histfiles[@]}"; do
         check_known_file "$f" "history"
+
+        # A finite pattern library can never classify every command that leaks
+        # credentials. Retain every non-empty history as a manual-review lead,
+        # even when scan_file found a HIGH match (there may be more) or skipped
+        # the content because it was unreadable, binary, or over the size cap.
+        [ -f "$f" ] && [ -s "$f" ] || continue
+        account="${home##*/}"
+        case "$f" in
+            /root/*) account="root" ;;
+            /home/*/*) account="${f#/home/}"; account="${account%%/*}" ;;
+            *) account="${f%/*}"; account="${account##*/}" ;;
+        esac
+        record_interest "CREDENTIAL_LEAD/history_review" \
+            "$f (user: $account; non-empty command history; review the entire file manually because credentials may use unrecognized commands or formats)"
     done
 }
 

@@ -43,6 +43,12 @@ cada plataforma que requieren un tratamiento dirigido.
 
 ### Artefactos locales de Linux
 
+Stage 1 enumera de forma segura el equivalente a `/home/*/.bash_history`,
+además de historiales de otros shells y herramientas. Todo historial no vacío
+se conserva como `CREDENTIAL_LEAD/history_review`, indicando el usuario, aunque
+ningún patrón encuentre una credencial. Las coincidencias como `sshpass -p`
+siguen apareciendo por separado como hallazgos `[HIGH]`.
+
 Stage 1 examina los buzones mbox legibles de `/var/mail` y `/var/spool/mail`.
 Los spools enlazados o con hard links se deduplican por la identidad del
 archivo, mientras que los buzones sin permisos se contabilizan como omitidos
@@ -113,6 +119,7 @@ La contraseña fue el disparador, pero se debe revisar el archivo completo. Cred
 | `[KEY]` | Llave privada o material como SAM/SYSTEM | Proteger e identificar la cuenta o sistema relacionado |
 | `ENCRYPTED_CREDENTIAL_LEAD` | Secreto cifrado que necesita llave, contraseña o descifrador | Identificar formato, llave y configuración asociada |
 | `CREDENTIAL_LEAD` | Artefacto que probablemente contiene o apunta a credenciales | Revisar el artefacto y archivos cercanos |
+| `CREDENTIAL_LEAD/history_review` | Historial de comandos no vacío de un usuario, haya coincidencia de patrón o no | Revisar manualmente el historial completo |
 | `REFERENCE` | Ruta encontrada en historial, sesión, workspace, recientes o shortcut | Seguir la ruta referenciada |
 | `USER_ARTIFACT/app_session` | Sesión con posibles destinos, comandos, identidades o credenciales adicionales | Revisar el archivo completo |
 | `[INTEREST]` | Archivo de alto valor sin credencial confirmada | Priorizar manualmente según categoría y ruta |
@@ -128,6 +135,7 @@ En modo limpio, las categorías de pistas aparecen bajo el tag visual `[LEAD]`:
 [LEAD] ENCRYPTED_CREDENTIAL_LEAD/encrypted_block  <archivo-cifrado>
 [LEAD] CREDENTIAL_LEAD/referenced_file          /ruta/config
 [LEAD] CREDENTIAL_LEAD/mailbox_review           /var/mail/<usuario>
+[LEAD] CREDENTIAL_LEAD/history_review           /home/<usuario>/.bash_history (user: <usuario>; ...)
 [LEAD] CREDENTIAL_LEAD/hidden_home_file         /home/<usuario>/.<nombre>
 [LEAD] REFERENCE                                history -> /ruta/config
 [LEAD] USER_ARTIFACT/app_session                <archivo-de-sesion>

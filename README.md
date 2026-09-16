@@ -31,8 +31,6 @@ A staged funnel narrows from known credential locations to suspicious files and 
  Stage 5   Content scan               tuned regexes for reusable credentials and encrypted leads
 ```
 
-Reference-led checks also inspect files that commonly reveal where credentials live, such as command histories, saved editor/application state, workspaces, recent shortcuts, and similar user artifacts. Session files remain review leads even when the first match is only one password: the same artifact may contain additional targets, identities, commands, paths, or credentials.
-
 ## What It Finds
 
 CredsHunter focuses on local, reusable, or investigation-worthy credential material:
@@ -226,6 +224,7 @@ Use `--no-color` / `-NoColor` when redirecting output, pasting results into repo
 | `[KEY]` | Private key or readable auth material such as SAM/SYSTEM hives | Protect it and identify the related identity/system |
 | `ENCRYPTED_CREDENTIAL_LEAD` | Encrypted secret that needs a key, password, or product-specific decryptor | Identify the format and companion key/configuration |
 | `CREDENTIAL_LEAD` | Artifact likely to contain or point to credential material | Inspect the artifact and nearby configuration |
+| `CREDENTIAL_LEAD/history_review` | Non-empty command history for a specific account, whether or not a pattern matched | Review the complete history manually |
 | `REFERENCE` | Path found in a history, session, workspace, recent file, or shortcut | Follow the referenced path |
 | `USER_ARTIFACT/app_session` | Saved application/editor session with possible additional targets, commands, identities, or credentials | Review the entire file, not only the matched line |
 | `[INTEREST]` | High-value file worth reviewing but not a confirmed credential | Triage manually using its category and path |
@@ -239,6 +238,7 @@ In clean mode, `ENCRYPTED_CREDENTIAL_LEAD`, `CREDENTIAL_LEAD`, `REFERENCE`, and 
 [LEAD] ENCRYPTED_CREDENTIAL_LEAD/encrypted_block  <encrypted-file>
 [LEAD] CREDENTIAL_LEAD/referenced_file  /path/to/config
 [LEAD] CREDENTIAL_LEAD/mailbox_review  /var/mail/<user>
+[LEAD] CREDENTIAL_LEAD/history_review  /home/<user>/.bash_history (user: <user>; ...)
 [LEAD] CREDENTIAL_LEAD/hidden_home_file  /home/<user>/.<name>
 [LEAD] REFERENCE  history -> /path/to/config
 [LEAD] USER_ARTIFACT/app_session  <session-file>
