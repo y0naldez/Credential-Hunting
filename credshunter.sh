@@ -559,7 +559,10 @@ CRED_PATTERNS=(
     'jdbc_url|jdbc:[a-z]+://[^[:space:]"]*[?&;]password=[^;&[:space:]"]{3,}'
 
     # ── URL-embedded credentials (top source for lateral movement) ───────
-    'url_credentials|(mysql|postgres(ql)?|mongodb(\+srv)?|redis|amqp|rabbitmq|ftp|ftps|sftp|ssh|smb|cifs|ldap[s]?|imap[s]?|smtp[s]?|https?)://[^[:space:]/:@]+:[^[:space:]/@]{2,}@'
+    # Double quotes and backslashes delimit JSON/string fields, not URL
+    # userinfo. Excluding them prevents adjacent JSON properties such as
+    # `{"url":"https://host","label":"@name"}` from becoming credentials.
+    'url_credentials|(mysql|postgres(ql)?|mongodb(\+srv)?|redis|amqp|rabbitmq|ftp|ftps|sftp|ssh|smb|cifs|ldap[s]?|imap[s]?|smtp[s]?|https?)://[^[:space:]/:@"\\]+:[^[:space:]/@"\\]{2,}@[^[:space:]/@"\\]+'
 
     # ── GPP cpassword (CRITICAL for AD lateral) ──────────────────────────
     'gpp_cpassword|cpassword[[:space:]]*=[[:space:]]*"[A-Za-z0-9+/=]{20,}"'
@@ -831,6 +834,13 @@ is_false_positive() {
     # Runtime decryptor call/reference, not a literal password. The decryptor
     # and hardcoded parameters are reported separately as leads.
     [[ "$lower" == *decrypt*"("* ]] && return 0
+    # Generated HTML documentation often prints an empty password input as an
+    # encoded example. Keep inputs with an explicit value= attribute because
+    # those can still expose a real default credential.
+    if [[ "$lower" == \&lt\;input*type=\&quot\;password\&quot\;* ]] &&
+       [[ "$lower" != *value=\&quot\;* ]]; then
+        return 0
+    fi
 
     # Variable interpolation / template markers
     case "$v" in
@@ -1472,6 +1482,9 @@ stage_skipped() {
 # Returns 0 on a real finding (after FP filter), 1 otherwise.
 classify_line() {
     local content="$1" file="$2" lineno="$3" source_label="$4"
+    local php_isset_re='isset\([^)]*(password|passwd|passphrase|pwd)[^)]*\)[[:space:]]*\?'
+    local php_concat_secret_re='\.[[:space:]]*\$[A-Za-z0-9_]*(password|passwd|passphrase|pwd)[A-Za-z0-9_]*[[:space:]]*\.'
+    local php_default_re='function[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\([^)]*\$(password|passwd|passphrase|pwd)[[:space:]]*=[[:space:]]*(false|true|null|[\047\042][\047\042])'
 
     # Skip pathologically long / trivially short lines before any regex work.
     # Bounds the per-pattern [[ =~ ]] loop on minified/base64/log lines (DoS
@@ -1497,11 +1510,37 @@ classify_line() {
     [[ "$content" =~ ^[[:space:]]*(PWD|PASSWORD)[[:space:]]*:[[:space:]]*[\"\']?(pwdAuth|Password[[:space:]]*/[[:space:]]*access[[:space:]]+token)[\"\']?,?[[:space:]]*$ ]] && return 1
     # /etc/nsswitch.conf uses `passwd: files systemd` to select account
     # databases.  It is routing syntax, not a password assignment.
-    if [ "${file##*/}" = "nsswitch.conf" ] && [[ "$content" =~ ^[[:space:]]*passwd:[[:space:]] ]]; then
-        return 1
+    case "${file##*/}" in
+        nsswitch.conf|nsswitch.conf.*)
+            [[ "$content" =~ ^[[:space:]]*passwd:[[:space:]] ]] && return 1
+            ;;
+    esac
+    # MySQL diagnostics report whether a password was supplied; YES/NO is not
+    # the password itself.
+    [[ "$content" =~ Using[[:space:]]+password:[[:space:]]*(YES|NO) ]] && return 1
+    # PHP runtime expressions and UI helpers frequently contain password-like
+    # assignments but no literal secret.
+    if [[ "$content" =~ $php_isset_re ]]; then
+        local php_fallback="${content##*:}"
+        php_fallback="${php_fallback#"${php_fallback%%[![:space:]]*}"}"
+        php_fallback="${php_fallback%"${php_fallback##*[![:space:]]}"}"
+        php_fallback="${php_fallback%;}"
+        php_fallback="${php_fallback%,}"
+        php_fallback="${php_fallback%)}"
+        php_fallback="${php_fallback%"${php_fallback##*[![:space:]]}"}"
+        case "${php_fallback,,}" in null|false|true|\'\'|'""') return 1 ;; esac
+        [[ "$php_fallback" =~ ^\$[A-Za-z_][A-Za-z0-9_]*(\[[^]]+\])?$ ]] && return 1
     fi
+    # A concatenated PHP password variable is a runtime reference. Requiring a
+    # password-named variable between two concatenation operators avoids
+    # suppressing literal passwords that merely contain `$` or a period.
+    [[ "$content" =~ $php_concat_secret_re ]] && return 1
+    [[ "$content" =~ \$[A-Za-z0-9_]*(password|passwd|pwd)[A-Za-z0-9_]*[[:space:]]*\?[[:space:]]*[\'\"]?(password|text)[\'\"]?[[:space:]]*: ]] && return 1
+    [[ "$content" =~ $php_default_re ]] && return 1
+    # Documentation lookup tables map SQL PASSWORD functions to help pages.
+    [[ "$content" =~ ^[[:space:]]*[\'\"]?(OLD_)?PASSWORD[\'\"]?[[:space:]]*:[[:space:]]*\[[^]]*(encryption|function)[_-] ]] && return 1
 
-    local entry label regex value matched_text preview
+    local entry label regex value matched_text preview preserve_url_weak=0
     for entry in "${CRED_PATTERNS[@]}"; do
         label="${entry%%|*}"
         regex="${entry#*|}"
@@ -1615,6 +1654,27 @@ classify_line() {
                         value="${BASH_REMATCH[1]}"
                     fi
                     ;;
+                url_credentials)
+                    # Extract user, password and host independently. Suppress a
+                    # weak word only when the whole authority is recognisably a
+                    # documentation placeholder; on a concrete host, `pass` or
+                    # `password` may unfortunately be the real credential.
+                    local url_authority url_user url_host
+                    url_authority="${matched_text#*://}"
+                    url_user="${url_authority%%:*}"
+                    value="${url_authority#*:}"
+                    value="${value%@*}"
+                    url_host="${url_authority#*@}"
+                    url_host="${url_host%%/*}"
+                    case "${url_host,,}" in
+                        host|hostname|example|example.*|*.example|*.example.*|hello.world.example.org)
+                            case "${url_user,,}:${value,,}" in
+                                user:pass|user:password|username:pass|username:password) return 1 ;;
+                            esac
+                            ;;
+                    esac
+                    case "${value,,}" in pass|password) preserve_url_weak=1 ;; esac
+                    ;;
             esac
             # Skip the generic FP filter ONLY for findings where the FULL match
             # IS the credential (hash dumps, format-anchored markers, XML value
@@ -1631,7 +1691,7 @@ classify_line() {
                 redis_requirepass|anaconda_rootpw) ;;
                 ldap_bindpw|ipsec_psk|snmp_community|snmp_com2sec) ;;
                 *)
-                    is_false_positive "$value" && return 1
+                    [ "$preserve_url_weak" -eq 0 ] && is_false_positive "$value" && return 1
                     ;;
             esac
             if app_session_artifact "$file" "$source_label"; then
@@ -2326,6 +2386,16 @@ scan_local_mailboxes() {
     for root in "${roots[@]}"; do
         [ -e "$root" ] || continue
         while IFS= read -r -d '' f; do
+            # Mail spool metadata/control files are not user mailboxes, so do
+            # not retain them as blanket manual-review leads. Still content-
+            # scan them: an unexpected literal credential must not be lost.
+            case "${f##*/}" in
+                .subscriptions)
+                    record_checked "mail_metadata" "$f"
+                    scan_file "$f" "mailbox_metadata"
+                    continue
+                    ;;
+            esac
             identity=$(stat -Lc '%d:%i' -- "$f" 2>/dev/null || true)
             if [ -z "$identity" ]; then
                 canonical=$(readlink -f -- "$f" 2>/dev/null || printf '%s' "$f")
@@ -3127,16 +3197,20 @@ prepare_clean_high() {
         # Translation catalogs often use credential-looking message IDs such
         # as `ftp_login_pass` whose values are UI labels ("FTP Password",
         # "Mot de passe FTP", ...), not credentials.  Treat them as clean-view
-        # noise only when the same PHP-array key appears in at least three
-        # sibling catalog files with at least two distinct translations.
-        function catalog_cluster(label, p, preview, q, dir, key, s) {
-            if (label !~ /(^|\/)php_array_secret$/) return ""
+        # noise only when the same PHP-array or JSON key appears in at least
+        # three sibling catalog files with at least two distinct translations.
+        function catalog_cluster(label, p, preview, q, dir, key, s, is_php, is_json) {
+            is_php=(label ~ /(^|\/)php_array_secret$/)
+            is_json=(label ~ /(^|\/)password_assign$/)
+            if (!is_php && !is_json) return ""
             q="/" tolower(p)
             gsub(/[\\]/, "/", q)
-            if (q !~ /\/(languages?|lang|locales?|i18n|l10n|translations?)\//) return ""
-            if (preview !~ /^[[:space:]]*[\047\042][^\047\042]+[\047\042][[:space:]]*=>[[:space:]]*[\047\042]/) return ""
+            if (q !~ /\/(languages?|lang|locales?|i18n|l10n|translations?|[^\/]+-languages?)\//) return ""
+            if (is_php && preview !~ /^[[:space:]]*[\047\042][^\047\042]+[\047\042][[:space:]]*=>[[:space:]]*[\047\042]/) return ""
+            if (is_json && preview !~ /^[[:space:]]*\042[^\042]+\042[[:space:]]*:[[:space:]]*\042/) return ""
             s=preview
-            sub(/^[^\047\042]*[\047\042]/, "", s)
+            if (is_php) sub(/^[^\047\042]*[\047\042]/, "", s)
+            else sub(/^[^\042]*\042/, "", s)
             key=s
             sub(/[\047\042].*$/, "", key)
             dir=q
@@ -3144,7 +3218,7 @@ prepare_clean_high() {
             # Common layouts insert a locale directory between the catalog
             # root and filename: lang/en/admin.php, lang/de/admin.php, etc.
             # Group across those locale siblings, not inside each locale.
-            if (dir ~ /\/(languages?|lang|locales?|i18n|l10n|translations?)\/[^\/]+$/)
+            if (dir ~ /\/(languages?|lang|locales?|i18n|l10n|translations?|[^\/]+-languages?)\/[^\/]+$/)
                 sub(/\/[^\/]+$/, "", dir)
             return dir "\034" tolower(key)
         }
@@ -3249,6 +3323,9 @@ prepare_clean_interest() {
                 q ~ /^\/etc\/apt\/trusted[.]gpg([.]d\/|$)/ ||
                 q ~ /^\/usr\/share\/keyrings\//) return 1
             if (cat != "high_value_file") return 0
+            # A specific detector (browser store, encrypted lead, etc.) is more
+            # informative than the generic extension-based classification.
+            if (special[q]) return 1
             # Installed TeamCity archives are deployable software, not
             # operator backups. Keep .BuildServer projectConfigs archives:
             # those may contain recoverable project settings.
@@ -3259,6 +3336,10 @@ prepare_clean_interest() {
             if (q ~ /^\/var\/lib\/(command-not-found\/commands[.]db|fwupd\/(pending[.]db|metadata\/.*[.]gz)|postfix\/smtp_scache[.]db)$/) return 1
             if (q ~ /^\/etc\/aliases[.]db$/ || q ~ /^\/etc\/apt\/sources[.]list[.]/) return 1
             if (q ~ /[.](sh|bash|crt|cer|csr|log)$/ ||
+                q ~ /\/share\/man\// ||
+                q ~ /^\/etc\/mail\/(access|domaintable|mailertable|virtusertable)[.]db$/ ||
+                q ~ /^\/etc\/(openldap\/certs|pki\/nssdb)\/(cert[0-9]+|secmod)[.]db$/ ||
+                (q ~ /\/mozilla\/firefox\/[^\/]+\// && q ~ /([.]sqlite|\/cert[0-9]+[.]db|\/secmod[.]db)$/) ||
                 q ~ /\/etc\/(console-setup|init[.]d|profile[.]d)\// ||
                 q ~ /\/var\/backups\/(alternatives([.]tar)?|apt[.]extended_states|dpkg[.](diversions|statoverride|status))[.][0-9]+[.]gz$/ ||
                 q ~ /\/var\/lib\/cassandra\/saved_caches\//) return 1
@@ -3266,8 +3347,13 @@ prepare_clean_interest() {
                 q !~ /\/system_auth\/roles-[^\/]+\/[^\/]+-data[.]db$/) return 1
             return 0
         }
+        NR == FNR {
+            q=tolower($2)
+            if ($1 != "high_value_file") special[q]=1
+            next
+        }
         !noisy($1, $2) { print }
-    ' "$INTEREST_FILE" | sort -u >"$out"
+    ' "$INTEREST_FILE" "$INTEREST_FILE" | sort -u >"$out"
 }
 
 print_clean_summary() {
