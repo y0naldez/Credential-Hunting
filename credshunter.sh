@@ -494,18 +494,23 @@ parse_args() {
     # using whatever prefix the start directory had (e.g. /tmp not /private/tmp
     # on macOS). Add the canonical form too as a fallback.
     local i raw abs canon
-    for i in "${!USER_EXCLUDE_PATHS[@]}"; do
-        raw="${USER_EXCLUDE_PATHS[$i]}"
-        case "$raw" in /*) abs="$raw" ;; *) abs="$(pwd)/$raw" ;; esac
-        [ "${#abs}" -gt 1 ] && abs="${abs%/}"
-        USER_EXCLUDE_PATHS[$i]="$abs"
-        EXCLUDE_PATHS+=("$abs")
-        canon=$(readlink -f -- "$abs" 2>/dev/null || true)
-        if [ -n "$canon" ] && [ "$canon" != "$abs" ]; then
-            [ "${#canon}" -gt 1 ] && canon="${canon%/}"
-            EXCLUDE_PATHS+=("$canon")
-        fi
-    done
+    # Bash 4.2 treats an empty array expansion as an unset variable under
+    # `set -u`. Gate the expansion so the documented Bash 4+ support remains
+    # valid while preserving the normal quoted-array behavior when populated.
+    if [ "${USER_EXCLUDE_PATHS[0]+set}" = set ]; then
+        for i in "${!USER_EXCLUDE_PATHS[@]}"; do
+            raw="${USER_EXCLUDE_PATHS[$i]}"
+            case "$raw" in /*) abs="$raw" ;; *) abs="$(pwd)/$raw" ;; esac
+            [ "${#abs}" -gt 1 ] && abs="${abs%/}"
+            USER_EXCLUDE_PATHS[$i]="$abs"
+            EXCLUDE_PATHS+=("$abs")
+            canon=$(readlink -f -- "$abs" 2>/dev/null || true)
+            if [ -n "$canon" ] && [ "$canon" != "$abs" ]; then
+                [ "${#canon}" -gt 1 ] && canon="${canon%/}"
+                EXCLUDE_PATHS+=("$canon")
+            fi
+        done
+    fi
 }
 
 # ============================================================================
@@ -1966,7 +1971,9 @@ check_shell_histories() {
     # such as `cat /home/*/.bash_history`, while also covering other common
     # shells and interactive tools. Tests/chroots can provide a colon-separated
     # home list through CREDSHUNTER_HOME_DIRS.
-    for home in "${homes[@]}"; do
+    # The conditional array form expands to zero arguments when empty even on
+    # Bash 4.2 with nounset enabled.
+    for home in ${homes[@]+"${homes[@]}"}; do
         [ -d "$home" ] || continue
         while IFS= read -r -d '' f; do histfiles+=("$f"); done < <(
             find -L "$home" -maxdepth 2 \( \
@@ -1980,7 +1987,7 @@ check_shell_histories() {
             \) -type f -print0 2>/dev/null)
     done
 
-    for f in "${histfiles[@]}"; do
+    for f in ${histfiles[@]+"${histfiles[@]}"}; do
         check_known_file "$f" "history"
 
         # A finite pattern library can never classify every command that leaks
@@ -2162,7 +2169,7 @@ check_home_dotfiles() {
         while IFS= read -r -d '' home; do homes+=("$home")
         done < <(find /home -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
     fi
-    for home in "${homes[@]}"; do
+    for home in ${homes[@]+"${homes[@]}"}; do
         [ -d "$home" ] || continue
         while IFS= read -r -d '' f; do
             bn="${f##*/}"
@@ -2565,7 +2572,7 @@ EXCLUDE_PATHS=(
 # expression that follows". Reused by every stage.
 FIND_EXCLUDE_ARGS=()
 build_find_excludes() {
-    [ "${#FIND_EXCLUDE_ARGS[@]}" -gt 0 ] && return   # compose once, reuse forever
+    [ "${FIND_EXCLUDE_ARGS[0]+set}" = set ] && return   # compose once, reuse forever
     local d inner=()
     for d in "${EXCLUDE_DIR_NAMES[@]}"; do
         inner+=( -o -type d -name "$d" )
@@ -2818,7 +2825,7 @@ enumerate_candidates() {
 }
 
 scan_user_paths_contents() {
-    [ ${#SCAN_PATHS[@]} -eq 0 ] && { warn "No paths provided; skipping."; return; }
+    [ "${SCAN_PATHS[0]+set}" = set ] || { warn "No paths provided; skipping."; return; }
     info "Enumerating candidate files…"
     # NUL-delimited throughout so filenames containing spaces/newlines survive.
     enumerate_candidates >"$CANDIDATE_FILES" 2>/dev/null
@@ -3358,7 +3365,7 @@ main() {
         warn "Size cap disabled (--no-size-limit) — every readable file will be inspected."
     fi
 
-    if [ "${#USER_EXCLUDE_PATHS[@]}" -gt 0 ]; then
+    if [ "${USER_EXCLUDE_PATHS[0]+set}" = set ]; then
         info "User exclusions (${W}${#USER_EXCLUDE_PATHS[@]}${NC}) — applied to stages 2-5 only:"
         local p
         for p in "${USER_EXCLUDE_PATHS[@]}"; do
@@ -3374,7 +3381,7 @@ main() {
         stage_skipped 1 "OS-level credential checks"
     fi
 
-    if [ ${#SCAN_PATHS[@]} -eq 0 ]; then
+    if [ "${SCAN_PATHS[0]+set}" != set ]; then
         warn "No paths supplied (-p). Skipping stages 2-5."
         warn "Tip: pass -p / to scan everything under root."
     else
