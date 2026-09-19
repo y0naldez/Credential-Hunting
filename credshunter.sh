@@ -1506,6 +1506,11 @@ classify_line() {
     # HTML-encoded documentation placeholder. Filter before value extraction,
     # which intentionally treats semicolons as assignment delimiters.
     [[ "$content" =~ (password|passwd|passphrase|pwd)[[:space:]]*[:=][[:space:]]*[\"\']?\&lt\;[^\&]*(password|passwd|passphrase|pwd|secret|token)[^\&]*\&gt\; ]] && return 1
+    if [[ "$content" =~ (password|passwd|passphrase|pwd)[[:space:]]*[:=][[:space:]]*\&lt\;input ]] &&
+       [[ "$content" == *type=\&quot\;password\&quot\;* ]] &&
+       [[ "$content" != *value=\&quot\;* ]]; then
+        return 1
+    fi
     # TeamCity UI field metadata, not assigned credential values.
     [[ "$content" =~ ^[[:space:]]*(PWD|PASSWORD)[[:space:]]*:[[:space:]]*[\"\']?(pwdAuth|Password[[:space:]]*/[[:space:]]*access[[:space:]]+token)[\"\']?,?[[:space:]]*$ ]] && return 1
     # /etc/nsswitch.conf uses `passwd: files systemd` to select account

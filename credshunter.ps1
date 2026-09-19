@@ -328,7 +328,10 @@ $script:RawPatterns = @(
 
     # ---- URL-embedded credentials ------------------------------------------
     @{ Label = 'url_credentials';
-       Regex = '(?i)(mysql|postgres(?:ql)?|mongodb(?:\+srv)?|redis|amqp|rabbitmq|ftp|ftps|sftp|ssh|smb|cifs|ldap[s]?|imap[s]?|smtp[s]?|https?)://[^\s/:@]+:[^\s/@]{2,}@' }
+       # Double quotes and backslashes delimit JSON/string fields, not URL
+       # userinfo. Require a host after @ so adjacent JSON properties cannot
+       # be mistaken for credentials.
+       Regex = '(?i)(mysql|postgres(?:ql)?|mongodb(?:\+srv)?|redis|amqp|rabbitmq|ftp|ftps|sftp|ssh|smb|cifs|ldap[s]?|imap[s]?|smtp[s]?|https?)://(?<user>[^\s/:@"\\]+):(?<secret>[^\s/@"\\]{2,})@(?<host>[^\s/@"\\]+)' }
 
     # ---- Windows-specific high-value ---------------------------------------
     @{ Label = 'gpp_cpassword';
@@ -687,6 +690,12 @@ function Test-FalsePositive { param([string]$Value)
     # Runtime decryptor call/reference, not a literal password. The decryptor
     # and hardcoded parameters are reported separately as leads.
     if ($lower -match 'decrypt.*\(')                                               { return $true }
+
+    # Generated HTML documentation often prints an empty password input as an
+    # encoded example. An explicit value= attribute remains eligible because it
+    # may expose a real default credential.
+    if ($lower -like '&lt;input*type=&quot;password&quot;*' -and
+        $lower -notlike '*value=&quot;*') { return $true }
 
     # Template / interpolation markers
     if ($v -match '\$\{[^}]+\}')                  { return $true }
@@ -2266,6 +2275,7 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
         foreach ($p in $script:CredPatterns) {
             $m = $p.Regex.Match($line)
             if (-not $m.Success) { continue }
+            $preserveUrlWeak = $false
 
             if (Test-EncryptedSecretValueLine -Line $line) { break }
 
@@ -2342,6 +2352,17 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
                     ($value -notmatch '[0-9]' -and $value -notmatch '[!@#$%^&*_=+?~-]') -or
                     $value -match '(?i)^(case-sensitive|not-available|not-disclosed|stored-securely|shown-below|shown-above|configured-below|configured-above)$') { break }
             }
+            if ($p.Label -eq 'url_credentials') {
+                $urlUser = $m.Groups['user'].Value
+                $value = $m.Groups['secret'].Value
+                $urlHost = $m.Groups['host'].Value
+                # Drop user:pass only when the complete authority is clearly a
+                # documentation placeholder. On a concrete host, pass/password
+                # can unfortunately be the real weak credential.
+                if ($urlHost -match '(?i)^(?:host|hostname|example|example\..+|.+\.example|.+\.example\..+|hello\.world\.example\.org)$' -and
+                    ("${urlUser}:$value") -match '(?i)^(?:user|username):(?:pass|password)$') { break }
+                $preserveUrlWeak = $value -match '(?i)^(?:pass|password)$'
+            }
 
             # -- Hard-coded line-level FP filter (real-host noise) --
             # SQL parameter references / masked passwords / SQL Telemetry
@@ -2356,14 +2377,34 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             if ($line -match 'PASSWORD\s*=\s*''\*+''')                       { break }
             if ($line -match 'SQLTelemetry\s*:\s*Setting')                   { break }
             if ($line -match 'SafeSqlCommand.*PASSWORD\s*=\s*''\*+''')       { break }
+            # MySQL reports only whether a password was supplied here, not its
+            # value.
+            if ($line -match '(?i)Using\s+password:\s*(?:YES|NO)')           { break }
             # Filter HTML-encoded documentation placeholders before the
             # semicolon-aware value extractor reduces `&lt;...&gt;` to `&lt`.
             if ($line -match '(?i)(password|passwd|passphrase|pwd)\s*[:=]\s*["'']?&lt;[^&]*(password|passwd|passphrase|pwd|secret|token)[^&]*&gt;') { break }
+            if ($line -match '(?i)(password|passwd|passphrase|pwd)\s*[:=]\s*&lt;input\b' -and
+                $line -match '(?i)type=&quot;password&quot;' -and
+                $line -notmatch '(?i)value=&quot;') { break }
             # TeamCity UI field metadata, not assigned credential values.
             if ($line -match '(?i)^\s*(PWD|PASSWORD)\s*:\s*["'']?(pwdAuth|Password\s*/\s*access\s+token)["'']?,?\s*$') { break }
+            # PHP runtime expressions and UI helpers that contain no literal
+            # credential. Preserve a hardcoded ternary fallback.
+            if ($line -match '(?i)isset\([^)]*(?:password|passwd|passphrase|pwd)[^)]*\)\s*\?') {
+                $colon = $line.LastIndexOf(':')
+                if ($colon -ge 0) {
+                    $fallback = $line.Substring($colon + 1).Trim().TrimEnd(';', ',', ')').Trim()
+                    if ($fallback -match '^(?i:null|false|true|''''|"")$' -or
+                        $fallback -match '^\$[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]+\])?$') { break }
+                }
+            }
+            if ($line -match '(?i)\.\s*\$[A-Za-z0-9_]*(?:password|passwd|passphrase|pwd)[A-Za-z0-9_]*\s*\.') { break }
+            if ($line -match '(?i)\$[A-Za-z0-9_]*(?:password|passwd|pwd)[A-Za-z0-9_]*\s*\?\s*["'']?(?:password|text)["'']?\s*:') { break }
+            if ($line -match '(?i)function\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\$(?:password|passwd|passphrase|pwd)\s*=\s*(?:false|true|null|''''|"")') { break }
+            if ($line -match '(?i)^\s*["'']?(?:OLD_)?PASSWORD["'']?\s*:\s*\[[^]]*(?:encryption|function)[_-]') { break }
 
             if (-not ($script:NoFPCheck -contains $p.Label)) {
-                if (Test-FalsePositive -Value $value) { break }
+                if (-not $preserveUrlWeak -and (Test-FalsePositive -Value $value)) { break }
             }
 
             $findingPreview = if ($isAppSession) {
@@ -2834,6 +2875,15 @@ function Test-BrowserCredFiles {
                 $fxProfiles = Join-Path $u 'AppData\Roaming\Mozilla\Firefox\Profiles'
                 if (Test-Path -LiteralPath $fxProfiles) {
                     Add-Interesting -Category 'firefox_profiles' -Path $fxProfiles
+                    Get-ChildItem -LiteralPath $fxProfiles -Directory -ErrorAction SilentlyContinue |
+                        ForEach-Object {
+                            foreach ($name in @('key4.db','key3.db','logins.json')) {
+                                $credentialFile = Join-Path $_.FullName $name
+                                if (Test-Path -LiteralPath $credentialFile -PathType Leaf) {
+                                    Add-Interesting -Category 'browser_credentials' -Path $credentialFile
+                                }
+                            }
+                        }
                 }
             }
     } catch {}
@@ -3677,14 +3727,21 @@ function Get-CleanLocalizationCatalogNoise {
 
     # Translation catalogs commonly contain credential-looking message IDs
     # such as `ftp_login_pass`, but their values are UI labels rather than
-    # secrets.  Suppress a cluster only when the same PHP-array key occurs in
-    # at least three sibling catalog files with at least two distinct rendered
+    # secrets. Suppress a cluster only when the same PHP-array or JSON key
+    # occurs in at least three sibling files with two distinct translations.
     $directNoise = [System.Collections.Generic.List[object]]::new()
     $rows = foreach ($finding in $Findings) {
-        if ($finding.Label -notmatch '(?:^|/)php_array_secret$') { continue }
+        $isPhp = $finding.Label -match '(?:^|/)php_array_secret$'
+        $isJson = $finding.Label -match '(?:^|/)password_assign$'
+        if (-not $isPhp -and -not $isJson) { continue }
         $normalizedPath = $finding.Path.Replace('\','/').ToLowerInvariant()
-        if ($normalizedPath -notmatch '(?:^|/)(?:languages?|lang|locales?|i18n|l10n|translations?)/') { continue }
-        $match = [regex]::Match($finding.Preview, '^\s*(?<quote>[''"])(?<key>[^''"]+)\k<quote>\s*=>\s*[''"]')
+        $catalogSegment = '(?:languages?|lang|locales?|i18n|l10n|translations?|[^/]+-languages?)'
+        if ($normalizedPath -notmatch "(?:^|/)$catalogSegment/") { continue }
+        $match = if ($isPhp) {
+            [regex]::Match($finding.Preview, '^\s*(?<quote>[''"])(?<key>[^''"]+)\k<quote>\s*=>\s*[''"]')
+        } else {
+            [regex]::Match($finding.Preview, '^\s*"(?<key>[^"]+)"\s*:\s*"')
+        }
         if (-not $match.Success) { continue }
         if ($match.Groups['key'].Value -match '^(?i)L_') {
             $directNoise.Add($finding)
@@ -3694,7 +3751,7 @@ function Get-CleanLocalizationCatalogNoise {
         # Group lang/en/admin.php, lang/de/admin.php, etc. at the shared
         # localization root. Grouping inside each locale never reaches the
         # three-file threshold and leaves every translated UI label visible.
-        if ($directory -match '^(?<root>.*?/(?:languages?|lang|locales?|i18n|l10n|translations?))/[^/]+$') {
+        if ($directory -match "^(?<root>.*?/$catalogSegment)/[^/]+$") {
             $directory = $Matches['root']
         }
         [PSCustomObject]@{
@@ -3715,10 +3772,21 @@ function Get-CleanLocalizationCatalogNoise {
     return ,$noise
 }
 
-function Test-CleanNoiseInterest { param([object]$Finding)
+function Test-CleanNoiseInterest {
+    param(
+        [object]$Finding,
+        [System.Collections.Generic.HashSet[string]]$SpecificPaths
+    )
     if (Test-CleanNoisePath -Path $Finding.Path -IncludePackageCaches) { return $true }
     if ($Finding.Category -ne 'high_value_file') { return $false }
     $p = $Finding.Path.Replace('\','/').ToLowerInvariant()
+    # Prefer a specific classification (for example browser_credentials) over
+    # the generic extension-based high_value_file entry for the same path.
+    if ($SpecificPaths -and $SpecificPaths.Contains($Finding.Path)) { return $true }
+    # Firefox profile databases unrelated to saved logins dominate a broad
+    # *.db/*.sqlite scan. key3/key4 and logins.json remain visible through the
+    # specific browser credential detector above.
+    if ($p -match '/mozilla/firefox/(?:profiles/)?[^/]+/(?:.*[.]sqlite|cert[0-9]+[.]db|secmod[.]db)$') { return $true }
     # Installed TeamCity archives are deployable software, not operator
     # backups. Keep .BuildServer projectConfigs archives visible.
     if ($p -match '/webapps/root/web-inf/plugins/.*[.](zip|tar|tgz|gz|7z|rar)$' -or
@@ -3879,8 +3947,12 @@ function Write-CleanSummary {
         if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
     }
 
+    $specificInterestPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($interest in $script:Interesting) {
+        if ($interest.Category -ne 'high_value_file') { [void]$specificInterestPaths.Add($interest.Path) }
+    }
     $cleanInteresting = @($script:Interesting | Where-Object {
-        -not (Test-CleanNoiseInterest -Finding $_)
+        -not (Test-CleanNoiseInterest -Finding $_ -SpecificPaths $specificInterestPaths)
     })
     $encrypted = @($cleanInteresting | Where-Object { $_.Category -like 'ENCRYPTED_CREDENTIAL_LEAD*' } | Sort-Object Category, Path)
     Write-CleanFindings -Title "Encrypted credential leads" -Items $encrypted -Renderer {
