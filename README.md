@@ -56,6 +56,10 @@ benefit from targeted handling.
 ### Linux Local Artifacts
 
 Stage 1 scans readable local mbox files in `/var/mail` and `/var/spool/mail`.
+In `--clean` mode it also performs a bounded scan of readable plaintext logs
+under `/var/log` when the effective user is root or belongs to `adm` or
+`systemd-journal`. This includes ordinary rotated names such as
+`vsftpd.log.1`; compressed rotations remain excluded from plaintext inspection.
 Aliased spools and hard links are deduplicated by file identity, while
 unreadable mailboxes are counted as skipped without stopping the hunt..
 
@@ -190,6 +194,12 @@ the same key appears with different translations across at least three sibling
 language files. Isolated values remain visible. `NOISE_SUPPRESSED` reports how
 many raw items were omitted from that view. Full mode retains those raw matches
 for exhaustive review.
+
+Clean mode also removes non-literal runtime references such as shell credential
+variables, password getter/hash calls, and password-field UI metadata from the
+directly usable section. Concrete literals remain `HIGH`. Matches from
+`.sample`, `.dist`, `.example`, and `.template` files are retained as historical
+`LEAD` entries rather than presented as immediately usable credentials.
 
 Generic installed scripts remain suppressed in clean mode, but backup scripts
 do not. Shell scripts located in backup directories or named with markers such

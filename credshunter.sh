@@ -542,6 +542,11 @@ CRED_PATTERNS=(
     # and character-class checks before reporting the captured token.
     'prose_password_unquoted|(^|[^A-Za-z_])((the|your|my|his|her|their|account|login|new|old|previous|current|default|temporary)[[:space:]]+)?(password|passphrase|pass)[[:space:]]+(is|was|remains?|will[[:space:]]+be)[[:space:]]*[:=-]?[[:space:]]+[^[:space:]<>"'"'"']{8,128}'
 
+    # vsftpd can be configured to log the supplied plaintext password after a
+    # successful login. Keep this signature service-specific: a broad
+    # `password "value"` rule is far too noisy in source trees and prose.
+    'vsftpd_login_password|\[[^]]+\][[:space:]]+OK[[:space:]]+LOGIN:[^,]*,[[:space:]]+[^[:space:],]+[[:space:]]+password[[:space:]]+["'"'"'][^[:space:]"'"'"']{3,128}["'"'"']'
+
     # ── DB / service-prefixed passwords ──────────────────────────────────
     'db_password|(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|sftp|cifs)[_-]?(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?([\\]+"|[^[:space:]"#$<>{}]){3,}'
     # Any OTHER identifier ending in _password/_pass/_pwd (covers OpenStack
@@ -2557,6 +2562,42 @@ check_app_session_artifacts() {
         \) -print0 2>/dev/null)
 }
 
+has_privileged_log_access() {
+    local uid groups
+    uid="${CREDSHUNTER_EFFECTIVE_UID:-$(id -u 2>/dev/null || printf 'unknown')}"
+    [ "$uid" = "0" ] && return 0
+
+    groups="${CREDSHUNTER_EFFECTIVE_GROUPS:-$(id -nG 2>/dev/null || true)}"
+    case " $groups " in
+        *" adm "*|*" systemd-journal "*) return 0 ;;
+    esac
+    return 1
+}
+
+check_privileged_text_logs() {
+    # Logs are intentionally absent from the normal recursive / scan. In clean
+    # mode, however, an account with the usual privileged-log groups can extract
+    # high-value disclosures with much less noise than an unrestricted walk.
+    [ "$CLEAN" -eq 1 ] || return 0
+    has_privileged_log_access || return 0
+
+    local log_root="${CREDSHUNTER_LOG_ROOT:-/var/log}" f
+    [ -d "$log_root" ] && [ -r "$log_root" ] || return 0
+    info "Stage 1.14 -- readable privileged text logs"
+
+    while IFS= read -r -d '' f; do
+        [ -r "$f" ] || continue
+        case "${f,,}" in
+            *.gz|*.bz2|*.xz|*.zst|*.lz4|*.zip) continue ;;
+        esac
+        scan_file "$f" "privileged_log"
+    done < <(find "$log_root" -maxdepth 3 -type f \( \
+        -iname '*.log' -o -iname '*.log.[0-9]*' \
+        -o -iname 'auth.log*' -o -iname 'secure*' \
+        -o -iname 'syslog*' -o -iname 'messages*' \
+        \) -print0 2>/dev/null)
+}
+
 run_system_checks() {
     IN_STAGE1=1
     run_stage1_check check_shell_histories
@@ -2572,6 +2613,7 @@ run_system_checks() {
     run_stage1_check check_misc_services
     run_stage1_check check_docker_kube
     run_stage1_check check_app_session_artifacts
+    run_stage1_check check_privileged_text_logs
     IN_STAGE1=0
 }
 
@@ -3227,6 +3269,34 @@ prepare_clean_high() {
                 sub(/\/[^\/]+$/, "", dir)
             return dir "\034" tolower(key)
         }
+        function example_path(q) {
+            return q ~ /\.(sample|dist|example|template)(\.|$)/ ||
+                   q ~ /\/(examples?|samples?|templates?)\//
+        }
+        function runtime_reference(label, preview, rhs, l) {
+            l=tolower(label)
+            rhs=tolower(preview)
+            sub(/^[^=]*=/, "", rhs)
+
+            # Shell commands whose credential argument is populated entirely
+            # from variables are operational hints, not directly reusable
+            # plaintext credentials.
+            if (l ~ /\/(curl_basic|mysql_cmd)$/ && preview ~ /[$][A-Za-z_][A-Za-z0-9_]*/) return 1
+
+            # Runtime getters, password hashing helpers, substitutions and
+            # command substitutions. Scope these to the RHS so a normal source
+            # assignment with a literal remains HIGH.
+            if (rhs ~ /^[[:space:]]*(\([^)]*\)[[:space:]]*)?[$][A-Za-z_][A-Za-z0-9_]*(->|[.])/) return 1
+            if (rhs ~ /^[[:space:]]*[`][^`]+[`]/) return 1
+            if (rhs ~ /(password|passwd|passphrase|pwd|secret)[A-Za-z0-9_]*::[A-Za-z0-9_]+[[:space:]]*\(/) return 1
+            if (rhs ~ /->[[:space:]]*(get|read|load|fetch)[A-Za-z0-9_]*(password|passwd|passphrase|pwd|secret)[A-Za-z0-9_]*[[:space:]]*\(/) return 1
+            if (rhs ~ /(^|[^A-Za-z0-9_])(substitute_vars|hash_password|get_user_password)[[:space:]]*\(/) return 1
+
+            # UI metadata toggles a field to password display mode but does not
+            # contain a credential value.
+            if (tolower(preview) ~ /(type[[:space:]]*=[>:]?[[:space:]]*[\047\042]password[\047\042]|[\047\042]password[\047\042][[:space:]]*:[[:space:]]*[\047\042]text[\047\042])/) return 1
+            return 0
+        }
         function noisy(p, preview, q, r) {
             q=tolower(p)
             r=tolower(preview)
@@ -3239,7 +3309,8 @@ prepare_clean_high() {
                    q ~ /[.]jar$/ ||
                    q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)$/ ||
-                   r ~ /^[[:space:]]*(#|;|[/][/]|--([[:space:]]|$)|rem([[:space:]]|$)|<!--|[/][*])/ ||
+                   example_path(q) ||
+                   r ~ /^[[:space:]]*(#|;|[*][[:space:]]|[/][/]|--([[:space:]]|$)|rem([[:space:]]|$)|<!--|[/][*])/ ||
                    r ~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/
         }
         NR == FNR {
@@ -3258,7 +3329,7 @@ prepare_clean_high() {
             # those are labels even when a key exists in only one locale.
             if (cluster != "" && (index(cluster, "\034l_") > 0 ||
                                   (files[cluster] >= 3 && values[cluster] >= 2))) next
-            if (!noisy($2, $4)) print
+            if (!noisy($2, $4) && !runtime_reference($1, $4)) print
         }
     ' "$HIGH_FILE" "$HIGH_FILE" | sort -u >"$out"
 }
@@ -3279,13 +3350,18 @@ prepare_clean_commented() {
                    q ~ /\/credshunter[.](sh|ps1)$/
         }
         function commented(r) {
-            return r ~ /^[[:space:]]*(#|;|[/][/]|--([[:space:]]|$)|rem([[:space:]]|$)|<!--|[/][*])/
+            return r ~ /^[[:space:]]*(#|;|[*][[:space:]]|[/][/]|--([[:space:]]|$)|rem([[:space:]]|$)|<!--|[/][*])/
+        }
+        function example_path(q) {
+            return q ~ /\.(sample|dist|example|template)(\.|$)/ ||
+                   q ~ /\/(examples?|samples?|templates?)\//
         }
         {
             q=tolower($2); r=tolower($4)
-            if (!noisy_path(q) && commented(r) && r !~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/) {
+            if (!noisy_path(q) && (commented(r) || example_path(q)) && r !~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/) {
                 sub(/^[^/]+\//, "", $1)
-                $1="commented/" $1
+                if (example_path(q)) $1="example/" $1
+                else $1="commented/" $1
                 print
             }
         }
