@@ -3291,6 +3291,7 @@ prepare_clean_high() {
             if (rhs ~ /(password|passwd|passphrase|pwd|secret)[A-Za-z0-9_]*::[A-Za-z0-9_]+[[:space:]]*\(/) return 1
             if (rhs ~ /->[[:space:]]*(get|read|load|fetch)[A-Za-z0-9_]*(password|passwd|passphrase|pwd|secret)[A-Za-z0-9_]*[[:space:]]*\(/) return 1
             if (rhs ~ /(^|[^A-Za-z0-9_])(substitute_vars|hash_password|get_user_password)[[:space:]]*\(/) return 1
+            if (rhs ~ /(^|::|->)(get_input_string|get_instance|get)[[:space:]]*\(/) return 1
 
             # UI metadata toggles a field to password display mode but does not
             # contain a credential value.
@@ -3329,9 +3330,62 @@ prepare_clean_high() {
             # those are labels even when a key exists in only one locale.
             if (cluster != "" && (index(cluster, "\034l_") > 0 ||
                                   (files[cluster] >= 3 && values[cluster] >= 2))) next
-            if (!noisy($2, $4) && !runtime_reference($1, $4)) print
+            if ($1 !~ /^privileged_log\// && !noisy($2, $4) && !runtime_reference($1, $4)) print
         }
     ' "$HIGH_FILE" "$HIGH_FILE" | sort -u >"$out"
+}
+
+prepare_clean_logs() {
+    local out="$1"
+    [ -s "$HIGH_FILE" ] || { : >"$out"; return; }
+    awk -F'\t' '
+        function package_event_noise(path, preview, q, r) {
+            q=tolower(path)
+            r=tolower(preview)
+            return q ~ /\/(dpkg[.]log([.][0-9]+)?|bootstrap[.]log)$/ &&
+                   r ~ /(^|[[:space:]:])(base-)?passwd(:[a-z0-9_-]+)?([[:space:]:]|$)/ &&
+                   r ~ /(dpkg:|configure|status|upgrade|unpack|install|dependency)/
+        }
+        $1 ~ /^privileged_log\// && !package_event_noise($2, $4) { print }
+    ' "$HIGH_FILE" | sort -u >"$out"
+}
+
+print_clean_log_findings() {
+    local file="$1"
+    [ -s "$file" ] || return 0
+    clean_section "Credentials exposed in logs"
+    local rendered
+    while IFS= read -r rendered || [ -n "$rendered" ]; do
+        clean_line "$rendered"
+    done < <(sort -u "$file" |
+        awk -F'\t' 'BEGIN { OFS="\t" }
+            {
+                fingerprint=$4
+                if ($1 ~ /\/vsftpd_login_password$/) {
+                    fingerprint=$4
+                    sub(/^.*, /, "", fingerprint)
+                    fingerprint=tolower(fingerprint)
+                }
+                print $0, fingerprint
+            }' |
+        sort -t $'\t' -k1,1 -k2,2 -k5,5 -k3,3n |
+        awk -F'\t' -v color="$Y" -v nc="$NC" -v dim="$D" '
+            function emit( location) {
+                if (count > 1) location = "lines " lines " (" count " occurrences)"
+                else location = "line " lines
+                printf "  %s[LOG]%s %s  %s%s: %s%s\n", color, nc, label, dim, path, location, nc
+                if (preview != "") printf "         %s%s%s\n", dim, preview, nc
+            }
+            {
+                key=$1 "\034" $2 "\034" $5
+                if (NR > 1 && key != previous) emit()
+                if (key != previous) {
+                    label=$1; path=$2; preview=$4; lines=$3; count=1; previous=key
+                } else {
+                    lines=lines ", " $3; count++
+                }
+            }
+            END { if (NR > 0) emit() }')
 }
 
 prepare_clean_commented() {
@@ -3442,9 +3496,11 @@ print_clean_summary() {
     log_line ""
     log_line "=== Clean findings summary ==="
 
-    local clean_high="$TMPDIR/clean-high.tsv" clean_commented="$TMPDIR/clean-commented.tsv"
+    local clean_high="$TMPDIR/clean-high.tsv" clean_logs="$TMPDIR/clean-logs.tsv"
+    local clean_commented="$TMPDIR/clean-commented.tsv"
     local clean_keys="$TMPDIR/clean-keys.tsv" clean_interest="$TMPDIR/clean-interest.tsv"
     prepare_clean_high "$clean_high"
+    prepare_clean_logs "$clean_logs"
     prepare_clean_commented "$clean_commented"
     prepare_clean_keys "$clean_keys"
     prepare_clean_interest "$clean_interest"
@@ -3463,6 +3519,7 @@ print_clean_summary() {
     fi
 
     print_clean_sql_aware_high "$clean_high"
+    print_clean_log_findings "$clean_logs"
     print_clean_tsv_findings "Commented or historical credential leads" "$clean_commented" "LEAD" "$Y" 1
 
     local original_interest="$INTEREST_FILE"
@@ -3472,7 +3529,7 @@ print_clean_summary() {
     print_clean_other_interest
     INTEREST_FILE="$original_interest"
 
-    local n_guar n_high n_commented n_key n_int n_name n_skip n_enc n_leads n_other
+    local n_guar n_high n_log n_commented n_key n_int n_name n_skip n_enc n_leads n_other
     n_guar=$( [ -s "$GUARANTEED_FILE" ] && sort -u "$GUARANTEED_FILE" | wc -l | tr -d ' ' || echo 0)
     n_high=$(if [ -s "$clean_high" ]; then
         awk -F'\t' '
@@ -3485,6 +3542,17 @@ print_clean_summary() {
                 }
                 print $1 "\034" $2 "\034" fingerprint
             }' "$clean_high" | sort -u | wc -l | tr -d ' '
+    else echo 0; fi)
+    n_log=$(if [ -s "$clean_logs" ]; then
+        awk -F'\t' '
+            {
+                fingerprint=$4
+                if ($1 ~ /\/vsftpd_login_password$/) {
+                    sub(/^.*, /, "", fingerprint)
+                    fingerprint=tolower(fingerprint)
+                }
+                print $1 "\034" $2 "\034" fingerprint
+            }' "$clean_logs" | sort -u | wc -l | tr -d ' '
     else echo 0; fi)
     n_commented=$( [ -s "$clean_commented" ] && wc -l <"$clean_commented" | tr -d ' ' || echo 0)
     n_key=$( [ -s "$clean_keys" ] && wc -l <"$clean_keys" | tr -d ' ' || echo 0)
@@ -3505,9 +3573,9 @@ print_clean_summary() {
     raw_high=$( [ -s "$HIGH_FILE" ] && sort -u "$HIGH_FILE" | wc -l | tr -d ' ' || echo 0)
     raw_key=$( [ -s "$KEY_FILE" ] && sort -u "$KEY_FILE" | wc -l | tr -d ' ' || echo 0)
     raw_int=$( [ -s "$INTEREST_FILE" ] && sort -u "$INTEREST_FILE" | wc -l | tr -d ' ' || echo 0)
-    suppressed=$(( raw_high - n_high - n_commented + raw_key - n_key + raw_int - n_int ))
-    CLEAN_ACTIONABLE=$(( n_high + n_key + n_guar ))
-    clean_line "  HIGH: $n_high  KEY: $n_key  CONTAINERS: $n_guar  ENCRYPTED_LEADS: $n_enc  LEADS: $n_leads  OTHER_INTEREST: $n_other  NOISE_SUPPRESSED: $suppressed  NAME: $n_name  SKIPPED: $n_skip"
+    suppressed=$(( raw_high - n_high - n_log - n_commented + raw_key - n_key + raw_int - n_int ))
+    CLEAN_ACTIONABLE=$(( n_high + n_log + n_key + n_guar ))
+    clean_line "  HIGH: $n_high  LOG_EVIDENCE: $n_log  KEY: $n_key  CONTAINERS: $n_guar  ENCRYPTED_LEADS: $n_enc  LEADS: $n_leads  OTHER_INTEREST: $n_other  NOISE_SUPPRESSED: $suppressed  NAME: $n_name  SKIPPED: $n_skip"
 
     if [ -n "$OUTPUT_FILE" ]; then
         clean_line ""

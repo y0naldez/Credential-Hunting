@@ -176,6 +176,7 @@ In clean mode, the final console output is grouped into:
 Private keys and auth material
 Credential containers
 Directly usable credentials
+Credentials exposed in logs
 Encrypted credential leads
 References and user-artifact leads
 Other interesting files
@@ -200,6 +201,12 @@ variables, password getter/hash calls, and password-field UI metadata from the
 directly usable section. Concrete literals remain `HIGH`. Matches from
 `.sample`, `.dist`, `.example`, and `.template` files are retained as historical
 `LEAD` entries rather than presented as immediately usable credentials.
+
+Credential-shaped evidence from privileged logs is shown separately as `LOG`
+instead of being mixed into `HIGH`. Repeated vsftpd entries with the same user
+and password are collapsed, while package-manager events mentioning the
+`passwd` package are treated as clean-view noise. Log evidence remains
+actionable for the process exit code and remains unchanged in full mode.
 
 Generic installed scripts remain suppressed in clean mode, but backup scripts
 do not. Shell scripts located in backup directories or named with markers such
