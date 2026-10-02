@@ -853,7 +853,11 @@ is_false_positive() {
         # Placeholder tag like <password> / <your-pw> (a letter must follow '<';
         # keeps real passwords containing '<3' etc. that PS also keeps).
         *'<'[A-Za-z_]*'>'*) return 0 ;;
-        *'$1'*|*'$2'*|*'$3'*|*'$$'*) return 0 ;;
+        # Positional parameters and the shell PID are references only when the
+        # complete value is the marker.  `$$` is also a common literal password
+        # fragment (for example P@$$w0rd); substring matching silently dropped
+        # those real credentials on Linux while the PowerShell engine kept them.
+        '$1'|'$2'|'$3'|'$$'|'${1}'|'${2}'|'${3}') return 0 ;;
         *'%'[A-Z_]*'%'*) return 0 ;;
         *'@@'*|*'__'*'__'*) return 0 ;;
     esac
@@ -3270,8 +3274,14 @@ prepare_clean_high() {
             return dir "\034" tolower(key)
         }
         function example_path(q) {
-            return q ~ /\.(sample|dist|example|template)(\.|$)/ ||
+            return q ~ /(^|[._-])(sample|dist|example|template)([._-]|$)/ ||
                    q ~ /\/(examples?|samples?|templates?)\//
+        }
+        function generated_test_or_dependency(q) {
+            return q ~ /\/(tests?|testdata|fixtures?)\// ||
+                   q ~ /\/(third_party|bower_components)\// ||
+                   q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
+                   q ~ /\/framework\/(gii|cli\/views\/webapp)\//
         }
         function runtime_reference(label, preview, rhs, l) {
             l=tolower(label)
@@ -3287,11 +3297,22 @@ prepare_clean_high() {
             # command substitutions. Scope these to the RHS so a normal source
             # assignment with a literal remains HIGH.
             if (rhs ~ /^[[:space:]]*(\([^)]*\)[[:space:]]*)?[$][A-Za-z_][A-Za-z0-9_]*(->|[.])/) return 1
+            if (rhs ~ /^[[:space:]]*(\([^)]*\)[[:space:]]*)?[$][A-Za-z_][A-Za-z0-9_]*(\[[^]]+\])?[[:space:]]*[;,]?[[:space:]]*$/) return 1
+            if (rhs ~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*(::|->)[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(/) return 1
+            if (preview ~ /\{?[$](this|model|config|settings|session)->[A-Za-z_][A-Za-z0-9_]*\}?/) return 1
             if (rhs ~ /^[[:space:]]*[`][^`]+[`]/) return 1
             if (rhs ~ /(password|passwd|passphrase|pwd|secret)[A-Za-z0-9_]*::[A-Za-z0-9_]+[[:space:]]*\(/) return 1
             if (rhs ~ /->[[:space:]]*(get|read|load|fetch)[A-Za-z0-9_]*(password|passwd|passphrase|pwd|secret)[A-Za-z0-9_]*[[:space:]]*\(/) return 1
             if (rhs ~ /(^|[^A-Za-z0-9_])(substitute_vars|hash_password|get_user_password)[[:space:]]*\(/) return 1
             if (rhs ~ /(^|::|->)(get_input_string|get_instance|get)[[:space:]]*\(/) return 1
+
+            # Comparisons, validation constants, schema declarations and UI
+            # widget names mention password fields but do not assign reusable
+            # values. These dominate installed application source trees.
+            if (preview ~ /[$]?[A-Za-z_][A-Za-z0-9_]*(password|passwd|pwd)[A-Za-z0-9_]*[[:space:]]*={2,3}/) return 1
+            if (tolower(preview) ~ /^[[:space:]]*const[[:space:]]+(error_|ldap_)[A-Za-z0-9_]*(password|passwd|pwd)/) return 1
+            if (tolower(preview) ~ /[\047\042](password|passwd|pwd)[\047\042][[:space:]]*=>[[:space:]]*[\047\042](active)?passwordfield[\047\042]/) return 1
+            if (tolower(preview) ~ /[\047\042](password|passwd|pwd)[\047\042][[:space:]]*=>[[:space:]]*[\047\042](text[[:space:]]+not[[:space:]]+null|string\()/) return 1
 
             # UI metadata toggles a field to password display mode but does not
             # contain a credential value.
@@ -3310,6 +3331,7 @@ prepare_clean_high() {
                    q ~ /[.]jar$/ ||
                    q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)$/ ||
+                   generated_test_or_dependency(q) ||
                    example_path(q) ||
                    r ~ /^[[:space:]]*(#|;|[*][[:space:]]|[/][/]|--([[:space:]]|$)|rem([[:space:]]|$)|<!--|[/][*])/ ||
                    r ~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/
@@ -3394,6 +3416,10 @@ prepare_clean_commented() {
     awk -F'\t' 'BEGIN { OFS="\t" }
         function noisy_path(q) {
             return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
+                   q ~ /\/(tests?|testdata|fixtures?)\// ||
+                   q ~ /\/(third_party|bower_components)\// ||
+                   q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
+                   q ~ /\/framework\/(gii|cli\/views\/webapp)\// ||
                    q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|extensions)\// ||
                    q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                    q ~ /\/vendor\/bundle\// ||
@@ -3407,7 +3433,7 @@ prepare_clean_commented() {
             return r ~ /^[[:space:]]*(#|;|[*][[:space:]]|[/][/]|--([[:space:]]|$)|rem([[:space:]]|$)|<!--|[/][*])/
         }
         function example_path(q) {
-            return q ~ /\.(sample|dist|example|template)(\.|$)/ ||
+            return q ~ /(^|[._-])(sample|dist|example|template)([._-]|$)/ ||
                    q ~ /\/(examples?|samples?|templates?)\//
         }
         {
@@ -3429,6 +3455,10 @@ prepare_clean_keys() {
         function noisy(p, q) {
             q=tolower(p)
             return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
+                   q ~ /\/(tests?|testdata|fixtures?)\// ||
+                   q ~ /\/(third_party|bower_components)\// ||
+                   q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
+                   q ~ /\/framework\/(gii|cli\/views\/webapp)\// ||
                    q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|cache|extensions)\// ||
                    q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                    q ~ /\/vendor\/bundle\// ||
@@ -3447,6 +3477,10 @@ prepare_clean_interest() {
         function noisy(cat, p, q) {
             q=tolower(p)
             if (q ~ /\/(node_modules|site-packages|dist-packages)\// ||
+                q ~ /\/(tests?|testdata|fixtures?)\// ||
+                q ~ /\/(third_party|bower_components)\// ||
+                q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
+                q ~ /\/framework\/(gii|cli\/views\/webapp)\// ||
                 q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|cache|extensions)\// ||
                 q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                 q ~ /\/vendor\/bundle\// ||

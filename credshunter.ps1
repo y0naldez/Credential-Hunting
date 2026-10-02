@@ -3697,6 +3697,10 @@ function Test-CleanNoisePath {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     $p = $Path.Replace('\','/').ToLowerInvariant()
     if ($p -match '/(node_modules|site-packages|dist-packages)/' -or
+        $p -match '/(tests?|testdata|fixtures?)/' -or
+        $p -match '/(third_party|bower_components)/' -or
+        $p -match '/assets/packages/' -or $p -match '/tmp/assets/' -or
+        $p -match '/framework/(gii|cli/views/webapp)/' -or
         $p -match '/var/lib/gems/[0-9.]+/(gems|extensions)/' -or
         $p -match '/usr/(local/)?lib/ruby/gems/' -or
         $p -match '/vendor/bundle/' -or
@@ -3716,9 +3720,41 @@ function Test-CleanCommentedFinding { param([object]$Finding)
     return $Finding.Preview -match '(?i)^\s*(?:#|;|//|--(?:\s|$)|REM(?:\s|$)|<!--|/\*)'
 }
 
+function Test-CleanRuntimeReferenceFinding { param([object]$Finding)
+    $preview = [string]$Finding.Preview
+    $label = [string]$Finding.Label
+    $rhs = ($preview -replace '^[^=]*=', '').Trim()
+
+    if ($label -match '/(?:curl_basic|mysql_cmd)$' -and $preview -match '\$[A-Za-z_]\w*') { return $true }
+    if ($rhs -match '^(?:\([^)]*\)\s*)?\$[A-Za-z_]\w*(?:->|\.)') { return $true }
+    if ($rhs -match '^(?:\([^)]*\)\s*)?\$[A-Za-z_]\w*(?:\[[^]]+\])?\s*[;,]?$') { return $true }
+    if ($rhs -match '^[A-Za-z_]\w*(?:::|->)[A-Za-z_]\w*\s*\(') { return $true }
+    if ($preview -match '\{?\$(?:this|model|config|settings|session)->[A-Za-z_]\w*\}?') { return $true }
+    if ($rhs -match '^`[^`]+`') { return $true }
+    if ($rhs -match '(?i)(?:password|passwd|passphrase|pwd|secret)\w*::\w+\s*\(') { return $true }
+    if ($rhs -match '(?i)->\s*(?:get|read|load|fetch)\w*(?:password|passwd|passphrase|pwd|secret)\w*\s*\(') { return $true }
+    if ($rhs -match '(?i)(?:^|[^A-Za-z0-9_])(?:substitute_vars|hash_password|get_user_password)\s*\(') { return $true }
+    if ($rhs -match '(?i)(?:^|::|->)(?:get_input_string|get_instance|get)\s*\(') { return $true }
+    if ($preview -match '(?i)\$?[A-Za-z_]\w*(?:password|passwd|pwd)\w*\s*={2,3}') { return $true }
+    if ($preview -match '(?i)^\s*const\s+(?:error_|ldap_)\w*(?:password|passwd|pwd)') { return $true }
+    if ($preview -match '(?i)[''"](?:password|passwd|pwd)[''"]\s*=>\s*[''"](?:active)?passwordfield[''"]') { return $true }
+    if ($preview -match '(?i)[''"](?:password|passwd|pwd)[''"]\s*=>\s*[''"](?:text\s+not\s+null|string\()') { return $true }
+    if ($preview -match '(?i)(?:type\s*=[>:]?\s*[''"]password[''"]|[''"]password[''"]\s*:\s*[''"]text[''"])') { return $true }
+    return $false
+}
+
+function Test-CleanExamplePath { param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $p = $Path.Replace('\','/').ToLowerInvariant()
+    return ($p -match '(?:^|[._-])(?:sample|dist|example|template)(?:[._-]|$)' -or
+            $p -match '/(?:examples?|samples?|templates?)/')
+}
+
 function Test-CleanNoiseFinding { param([object]$Finding)
     if (Test-CleanNoisePath -Path $Finding.Path) { return $true }
     return ((Test-CleanCommentedFinding -Finding $Finding) -or
+            (Test-CleanExamplePath -Path $Finding.Path) -or
+            (Test-CleanRuntimeReferenceFinding -Finding $Finding) -or
             $Finding.Preview -match '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]')
 }
 
@@ -3872,7 +3908,7 @@ function Write-CleanSummary {
     $displayHighGroups = @($nonSqlHighGroups + $sqlHighGroups | Sort-Object Path, FirstLine, Label)
 
     $commented = @($script:HighFindings | Where-Object {
-        (Test-CleanCommentedFinding -Finding $_) -and
+        ((Test-CleanCommentedFinding -Finding $_) -or (Test-CleanExamplePath -Path $_.Path)) -and
         -not $localizationCatalogNoise.Contains($_) -and
         -not (Test-CleanNoisePath -Path $_.Path) -and
         $_.Preview -notmatch '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]'
@@ -3942,7 +3978,8 @@ function Write-CleanSummary {
         } elseif ($f.LineNumbers.Count -gt 1) {
             "{0}: lines {1} ({2} occurrences)" -f $f.Path, ($f.LineNumbers -join ', '), $f.Occurrences
         } else { $f.Path }
-        $label = 'commented/' + ($f.Label -replace '^[^/]+/', '')
+        $prefix = if (Test-CleanExamplePath -Path $f.Path) { 'example/' } else { 'commented/' }
+        $label = $prefix + ($f.Label -replace '^[^/]+/', '')
         Write-CleanLine ("  $($script:CY)[LEAD]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $label, $location)
         if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
     }

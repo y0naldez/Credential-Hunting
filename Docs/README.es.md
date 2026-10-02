@@ -147,7 +147,8 @@ En modo limpio, las llaves privadas aparecen antes que las coincidencias de
 password. Las coincidencias completamente comentadas se mueven a una sección
 separada de pistas históricas. La vista omite documentación de paquetes y
 dependencias instaladas (por ejemplo Ruby gems, archivos `.jar`,
-`node_modules` y Python site-packages). También omite coincidencias basadas sólo
+`node_modules`, Python site-packages, árboles `third_party`, fixtures de prueba y
+cachés de assets generados). También omite coincidencias basadas sólo
 en el nombre para certificados públicos, scripts del sistema, logs rutinarios,
 respaldos del gestor de paquetes y componentes de Cassandra sin datos de
 autenticación. Las entradas PHP repetidas de catálogos de idioma, como
@@ -156,6 +157,12 @@ misma clave aparece con traducciones diferentes en al menos tres archivos de
 idioma del mismo directorio; los valores aislados siguen visibles. `NOISE_SUPPRESSED`
 indica cuántos elementos crudos se ocultaron.
 El modo completo los conserva para una revisión exhaustiva.
+
+Las referencias calculadas en tiempo de ejecución, comparaciones, metadatos de
+campos de contraseña y declaraciones de esquema no se presentan como
+credenciales directamente utilizables. Los archivos `.sample`, `.dist`,
+`.example` y `.template`, incluidos nombres con guion como `config-sample.php`,
+se conservan como pistas históricas `[LEAD]`.
 
 Los scripts genéricos instalados continúan filtrándose en modo limpio, pero los
 scripts de respaldo no. Un script de shell ubicado en un directorio de backups

@@ -187,7 +187,8 @@ Clean mode is a prioritized triage view. It promotes private keys ahead of
 password matches and moves fully commented credential matches to a separate
 historical-leads section. It suppresses package documentation and installed
 dependency artifacts (for example Ruby gems, `.jar` files,
-`node_modules`, and Python site-packages). It also omits name-only hits for
+`node_modules`, Python site-packages, `third_party` trees, test fixtures, and
+generated asset caches). It also omits name-only hits for
 public certificates, system scripts, routine logs, package-manager backups, and
 non-authentication Cassandra components. Repeated PHP localization entries such
 as `ftp_login_pass => "FTP Password"` are also collapsed as catalog noise when
@@ -199,8 +200,9 @@ for exhaustive review.
 Clean mode also removes non-literal runtime references such as shell credential
 variables, password getter/hash calls, and password-field UI metadata from the
 directly usable section. Concrete literals remain `HIGH`. Matches from
-`.sample`, `.dist`, `.example`, and `.template` files are retained as historical
-`LEAD` entries rather than presented as immediately usable credentials.
+`.sample`, `.dist`, `.example`, and `.template` files—including hyphenated names
+such as `config-sample.php`—are retained as historical `LEAD` entries rather
+than presented as immediately usable credentials.
 
 Credential-shaped evidence from privileged logs is shown separately as `LOG`
 instead of being mixed into `HIGH`. Repeated vsftpd entries with the same user
