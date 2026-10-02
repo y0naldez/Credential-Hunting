@@ -3277,7 +3277,7 @@ prepare_clean_high() {
             return q ~ /(^|[._-])(sample|dist|example|template)([._-]|$)/ ||
                    q ~ /\/(examples?|samples?|templates?)\//
         }
-        function generated_test_or_dependency(q) {
+        function contextual_path(q) {
             return q ~ /\/(tests?|testdata|fixtures?)\// ||
                    q ~ /\/(third_party|bower_components)\// ||
                    q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
@@ -3331,7 +3331,7 @@ prepare_clean_high() {
                    q ~ /[.]jar$/ ||
                    q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)$/ ||
-                   generated_test_or_dependency(q) ||
+                   contextual_path(q) ||
                    example_path(q) ||
                    r ~ /^[[:space:]]*(#|;|[*][[:space:]]|[/][/]|--([[:space:]]|$)|rem([[:space:]]|$)|<!--|[/][*])/ ||
                    r ~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/
@@ -3416,10 +3416,6 @@ prepare_clean_commented() {
     awk -F'\t' 'BEGIN { OFS="\t" }
         function noisy_path(q) {
             return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
-                   q ~ /\/(tests?|testdata|fixtures?)\// ||
-                   q ~ /\/(third_party|bower_components)\// ||
-                   q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
-                   q ~ /\/framework\/(gii|cli\/views\/webapp)\// ||
                    q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|extensions)\// ||
                    q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                    q ~ /\/vendor\/bundle\// ||
@@ -3436,11 +3432,17 @@ prepare_clean_commented() {
             return q ~ /(^|[._-])(sample|dist|example|template)([._-]|$)/ ||
                    q ~ /\/(examples?|samples?|templates?)\//
         }
+        function contextual_path(q) {
+            return q ~ /\/(tests?|testdata|fixtures?|third_party|bower_components)\// ||
+                   q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
+                   q ~ /\/framework\/(gii|cli\/views\/webapp)\//
+        }
         {
             q=tolower($2); r=tolower($4)
-            if (!noisy_path(q) && (commented(r) || example_path(q)) && r !~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/) {
+            if (!noisy_path(q) && (commented(r) || example_path(q) || contextual_path(q)) && r !~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/) {
                 sub(/^[^/]+\//, "", $1)
                 if (example_path(q)) $1="example/" $1
+                else if (contextual_path(q)) $1="context/" $1
                 else $1="commented/" $1
                 print
             }
@@ -3455,10 +3457,6 @@ prepare_clean_keys() {
         function noisy(p, q) {
             q=tolower(p)
             return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
-                   q ~ /\/(tests?|testdata|fixtures?)\// ||
-                   q ~ /\/(third_party|bower_components)\// ||
-                   q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
-                   q ~ /\/framework\/(gii|cli\/views\/webapp)\// ||
                    q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|cache|extensions)\// ||
                    q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                    q ~ /\/vendor\/bundle\// ||
@@ -3477,10 +3475,6 @@ prepare_clean_interest() {
         function noisy(cat, p, q) {
             q=tolower(p)
             if (q ~ /\/(node_modules|site-packages|dist-packages)\// ||
-                q ~ /\/(tests?|testdata|fixtures?)\// ||
-                q ~ /\/(third_party|bower_components)\// ||
-                q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
-                q ~ /\/framework\/(gii|cli\/views\/webapp)\// ||
                 q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|cache|extensions)\// ||
                 q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                 q ~ /\/vendor\/bundle\// ||
@@ -3491,6 +3485,10 @@ prepare_clean_interest() {
                 q ~ /\/credshunter[.](sh|ps1)(:|$)/ ||
                 q ~ /^\/etc\/apt\/trusted[.]gpg([.]d\/|$)/ ||
                 q ~ /^\/usr\/share\/keyrings\//) return 1
+            if ((cat == "high_value_file" || cat == "CREDENTIAL_LEAD/zip_container") &&
+                (q ~ /\/(tests?|testdata|fixtures?|third_party|bower_components)\// ||
+                 q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
+                 q ~ /\/framework\/(gii|cli\/views\/webapp)\//)) return 1
             if (cat != "high_value_file") return 0
             # A specific detector (browser store, encrypted lead, etc.) is more
             # informative than the generic extension-based classification.
@@ -3554,7 +3552,7 @@ print_clean_summary() {
 
     print_clean_sql_aware_high "$clean_high"
     print_clean_log_findings "$clean_logs"
-    print_clean_tsv_findings "Commented or historical credential leads" "$clean_commented" "LEAD" "$Y" 1
+    print_clean_tsv_findings "Review-only credential leads" "$clean_commented" "LEAD" "$Y" 1
 
     local original_interest="$INTEREST_FILE"
     INTEREST_FILE="$clean_interest"

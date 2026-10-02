@@ -147,8 +147,10 @@ En modo limpio, las llaves privadas aparecen antes que las coincidencias de
 password. Las coincidencias completamente comentadas se mueven a una sección
 separada de pistas históricas. La vista omite documentación de paquetes y
 dependencias instaladas (por ejemplo Ruby gems, archivos `.jar`,
-`node_modules`, Python site-packages, árboles `third_party`, fixtures de prueba y
-cachés de assets generados). También omite coincidencias basadas sólo
+`node_modules` y Python site-packages). Las coincidencias con credenciales
+literales en árboles `third_party`, fixtures de prueba y cachés de assets
+generados se conservan como pistas `[LEAD]` para revisión; allí sólo se omiten
+los indicios genéricos basados en el tipo de archivo. También omite coincidencias basadas sólo
 en el nombre para certificados públicos, scripts del sistema, logs rutinarios,
 respaldos del gestor de paquetes y componentes de Cassandra sin datos de
 autenticación. Las entradas PHP repetidas de catálogos de idioma, como

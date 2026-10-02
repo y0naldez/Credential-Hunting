@@ -3697,10 +3697,6 @@ function Test-CleanNoisePath {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     $p = $Path.Replace('\','/').ToLowerInvariant()
     if ($p -match '/(node_modules|site-packages|dist-packages)/' -or
-        $p -match '/(tests?|testdata|fixtures?)/' -or
-        $p -match '/(third_party|bower_components)/' -or
-        $p -match '/assets/packages/' -or $p -match '/tmp/assets/' -or
-        $p -match '/framework/(gii|cli/views/webapp)/' -or
         $p -match '/var/lib/gems/[0-9.]+/(gems|extensions)/' -or
         $p -match '/usr/(local/)?lib/ruby/gems/' -or
         $p -match '/vendor/bundle/' -or
@@ -3750,10 +3746,19 @@ function Test-CleanExamplePath { param([string]$Path)
             $p -match '/(?:examples?|samples?|templates?)/')
 }
 
+function Test-CleanContextPath { param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $p = $Path.Replace('\','/').ToLowerInvariant()
+    return ($p -match '/(?:tests?|testdata|fixtures?|third_party|bower_components)/' -or
+            $p -match '/assets/packages/' -or $p -match '/tmp/assets/' -or
+            $p -match '/framework/(?:gii|cli/views/webapp)/')
+}
+
 function Test-CleanNoiseFinding { param([object]$Finding)
     if (Test-CleanNoisePath -Path $Finding.Path) { return $true }
     return ((Test-CleanCommentedFinding -Finding $Finding) -or
             (Test-CleanExamplePath -Path $Finding.Path) -or
+            (Test-CleanContextPath -Path $Finding.Path) -or
             (Test-CleanRuntimeReferenceFinding -Finding $Finding) -or
             $Finding.Preview -match '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]')
 }
@@ -3814,6 +3819,8 @@ function Test-CleanNoiseInterest {
         [System.Collections.Generic.HashSet[string]]$SpecificPaths
     )
     if (Test-CleanNoisePath -Path $Finding.Path -IncludePackageCaches) { return $true }
+    if ((Test-CleanContextPath -Path $Finding.Path) -and
+        ($Finding.Category -eq 'high_value_file' -or $Finding.Category -eq 'CREDENTIAL_LEAD/zip_container')) { return $true }
     if ($Finding.Category -ne 'high_value_file') { return $false }
     $p = $Finding.Path.Replace('\','/').ToLowerInvariant()
     # Prefer a specific classification (for example browser_credentials) over
@@ -3908,7 +3915,9 @@ function Write-CleanSummary {
     $displayHighGroups = @($nonSqlHighGroups + $sqlHighGroups | Sort-Object Path, FirstLine, Label)
 
     $commented = @($script:HighFindings | Where-Object {
-        ((Test-CleanCommentedFinding -Finding $_) -or (Test-CleanExamplePath -Path $_.Path)) -and
+        ((Test-CleanCommentedFinding -Finding $_) -or
+         (Test-CleanExamplePath -Path $_.Path) -or
+         (Test-CleanContextPath -Path $_.Path)) -and
         -not $localizationCatalogNoise.Contains($_) -and
         -not (Test-CleanNoisePath -Path $_.Path) -and
         $_.Preview -notmatch '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]'
@@ -3971,14 +3980,18 @@ function Write-CleanSummary {
         if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
     }
 
-    Write-CleanFindings -Title "Commented or historical credential leads" -Items $commentedGroups -Renderer {
+    Write-CleanFindings -Title "Review-only credential leads" -Items $commentedGroups -Renderer {
         param($f)
         $location = if ($f.LineNumbers.Count -eq 1) {
             "{0}: line {1}" -f $f.Path, $f.LineNumbers[0]
         } elseif ($f.LineNumbers.Count -gt 1) {
             "{0}: lines {1} ({2} occurrences)" -f $f.Path, ($f.LineNumbers -join ', '), $f.Occurrences
         } else { $f.Path }
-        $prefix = if (Test-CleanExamplePath -Path $f.Path) { 'example/' } else { 'commented/' }
+        $prefix = if (Test-CleanExamplePath -Path $f.Path) {
+            'example/'
+        } elseif (Test-CleanContextPath -Path $f.Path) {
+            'context/'
+        } else { 'commented/' }
         $label = $prefix + ($f.Label -replace '^[^/]+/', '')
         Write-CleanLine ("  $($script:CY)[LEAD]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $label, $location)
         if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }

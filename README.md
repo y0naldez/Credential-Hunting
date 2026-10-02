@@ -187,8 +187,10 @@ Clean mode is a prioritized triage view. It promotes private keys ahead of
 password matches and moves fully commented credential matches to a separate
 historical-leads section. It suppresses package documentation and installed
 dependency artifacts (for example Ruby gems, `.jar` files,
-`node_modules`, Python site-packages, `third_party` trees, test fixtures, and
-generated asset caches). It also omits name-only hits for
+`node_modules`, and Python site-packages). Literal credential matches from
+`third_party` trees, test fixtures, and generated asset caches are retained as
+review-only `LEAD` entries, while generic file-only hints there are omitted. It
+also omits name-only hits for
 public certificates, system scripts, routine logs, package-manager backups, and
 non-authentication Cassandra components. Repeated PHP localization entries such
 as `ftp_login_pass => "FTP Password"` are also collapsed as catalog noise when
