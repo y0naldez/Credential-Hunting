@@ -3767,7 +3767,7 @@ function Test-CleanPandoraSourceNoise { param([object]$Finding)
         $p -match '/include/help/[^/]+/help_export_server[.]php$') { return $true }
     if ($preview -match '(?i)[''"]password[''"]\s*=>\s*[''"]images/(?:lock|password)[.](?:png|svg)[''"]') { return $true }
     if ($preview -match '(?i)[''"]token[''"]\s*=>\s*[''"](?:files_repo_installed|skip_login_help_dialog|status_monitor_fields|event_fields|progress_update|progress_update_status|snmp_translations)[''"]') { return $true }
-    if ($preview -match '(?i)\$[a-z_]*(?:password|passwd|pwd|pass)[a-z_]*\s*=\s*(?:\([^)]*\)\s*)?(?:get_parameter|io_(?:input|output)_password|io_safe_output|db_get_value_sql)\s*\(') { return $true }
+    if ($preview -match '(?i)\$[a-z0-9_]*(?:password|passwd|pwd|pass)[a-z0-9_]*\s*=\s*(?:\([^)]*\)\s*)?(?:get_parameter|io_(?:input|output)_password|io_safe_output|db_get_value_sql)\s*\(') { return $true }
 
     if ($p -match '/include/class/consolesupervisor[.]php$' -and
         ($preview -match '(?i)admin_with_default_pass' -or

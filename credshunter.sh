@@ -3361,7 +3361,7 @@ prepare_clean_high() {
             # identifiers and runtime getters. None of them is a literal secret.
             if (r ~ /[\047\042]password[\047\042][[:space:]]*=>[[:space:]]*[\047\042]images\/(lock|password)[.](png|svg)[\047\042]/) return 1
             if (r ~ /[\047\042]token[\047\042][[:space:]]*=>[[:space:]]*[\047\042](files_repo_installed|skip_login_help_dialog|status_monitor_fields|event_fields|progress_update|progress_update_status|snmp_translations)[\047\042]/) return 1
-            if (r ~ /[$][a-z_]*(password|passwd|pwd|pass)[a-z_]*[[:space:]]*=[[:space:]]*(\([^)]*\)[[:space:]]*)?(get_parameter|io_(input|output)_password|io_safe_output|db_get_value_sql)[[:space:]]*\(/) return 1
+            if (r ~ /[$][a-z0-9_]*(password|passwd|pwd|pass)[a-z0-9_]*[[:space:]]*=[[:space:]]*(\([^)]*\)[[:space:]]*)?(get_parameter|io_(input|output)_password|io_safe_output|db_get_value_sql)[[:space:]]*\(/) return 1
 
             # Published hashes used solely to test whether admin still has the
             # stock password are constants in ConsoleSupervisor, not recovered
@@ -3503,7 +3503,7 @@ prepare_clean_commented() {
                 q ~ /\/include\/help\/[^\/]+\/help_export_server[.]php$/) return 1
             if (r ~ /[\047\042]password[\047\042][[:space:]]*=>[[:space:]]*[\047\042]images\/(lock|password)[.](png|svg)[\047\042]/) return 1
             if (r ~ /[\047\042]token[\047\042][[:space:]]*=>[[:space:]]*[\047\042](files_repo_installed|skip_login_help_dialog|status_monitor_fields|event_fields|progress_update|progress_update_status|snmp_translations)[\047\042]/) return 1
-            if (r ~ /[$][a-z_]*(password|passwd|pwd|pass)[a-z_]*[[:space:]]*=[[:space:]]*(\([^)]*\)[[:space:]]*)?(get_parameter|io_(input|output)_password|io_safe_output|db_get_value_sql)[[:space:]]*\(/) return 1
+            if (r ~ /[$][a-z0-9_]*(password|passwd|pwd|pass)[a-z0-9_]*[[:space:]]*=[[:space:]]*(\([^)]*\)[[:space:]]*)?(get_parameter|io_(input|output)_password|io_safe_output|db_get_value_sql)[[:space:]]*\(/) return 1
             if (q ~ /\/include\/class\/consolesupervisor[.]php$/ &&
                 (r ~ /admin_with_default_pass/ ||
                  r ~ /1da7ee7d45b96d0e1f45ee4ee23da560/ ||
