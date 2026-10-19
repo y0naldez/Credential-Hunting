@@ -320,6 +320,13 @@ $script:RawPatterns = @(
     @{ Label = 'prefixed_password';
        Regex = '(?im)[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s"#<>{}]){3,}' }
 
+    # Whitespace-delimited Pandora FMS configuration directives. The scan loop
+    # below accepts this pattern only for pandora_server.conf/pandora_agent.conf.
+    @{ Label = 'pandora_config_secret';
+       Regex = '(?im)^\s*(?:dbpass|ha_dbpass|console_pass|encryption_passphrase|server_pwd|server_password|proxy_pass(?:word)?|password)\s+["'']?(?<secret>[^\s#"'']{3,})' }
+    @{ Label = 'pandora_console_config_secret';
+       Regex = '(?im)\$config\[[''"](?:dbpass|encryption_passphrase)[''"]\]\s*=\s*(?<quote>[''"])(?<secret>[^''"]{3,})\k<quote>' }
+
     # ---- Connection-string passwords (.NET / JDBC / ODBC) -------------------
     @{ Label = 'connection_string';
        Regex = '(?im)(server|host|data[ _-]?source)\s*=.{1,200}(password|pwd)\s*=\s*["'']?[^;&\s"]{3,}' }
@@ -2277,6 +2284,15 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             if (-not $m.Success) { continue }
             $preserveUrlWeak = $false
 
+            if ($p.Label -eq 'pandora_config_secret') {
+                $pandoraPath = $FullPath.Replace('\','/').ToLowerInvariant()
+                if ($pandoraPath -notmatch '/etc/pandora/pandora_(?:server|agent)[.]conf$') { continue }
+            }
+            if ($p.Label -eq 'pandora_console_config_secret') {
+                $pandoraConsolePath = $FullPath.Replace('\','/').ToLowerInvariant()
+                if ($pandoraConsolePath -notmatch '/pandora_console/include/config[.]php$') { continue }
+            }
+
             if (Test-EncryptedSecretValueLine -Line $line) { break }
 
             # Commented example skip: stock configs ship docs like
@@ -2328,7 +2344,8 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
             # "DefaultPassword" and would otherwise latch onto a keyword in the value).
             if ($p.Label -eq 'drupal_password' -or $p.Label -eq 'php_array_secret' -or $p.Label -eq 'wp_db_password' -or
                 $p.Label -eq 'joomla_password' -or $p.Label -eq 'define_secret' -or
-                $p.Label -eq 'php_db_connect' -or $p.Label -eq 'autologon_password') {
+                $p.Label -eq 'php_db_connect' -or $p.Label -eq 'autologon_password' -or
+                $p.Label -eq 'pandora_console_config_secret') {
                 $mq = [regex]::Match($line, '["'']([^"'']+)["''][^"'']*$')
                 if ($mq.Success) { $value = $mq.Groups[1].Value }
             }
@@ -3739,11 +3756,32 @@ function Test-CleanRuntimeReferenceFinding { param([object]$Finding)
     return $false
 }
 
+function Test-CleanPandoraSourceNoise { param([object]$Finding)
+    $p = ([string]$Finding.Path).Replace('\','/').ToLowerInvariant()
+    if ($p -notmatch '/pandora_console/') { return $false }
+    $preview = [string]$Finding.Preview
+
+    if ($p -match '/include/graphs/flot/jquery[.]js$' -or
+        $p -match '/include/javascript/jquery[.]js$' -or
+        $p -match '/mobile/include/javascript/jquery[.]mobile[^/]*[.]js$' -or
+        $p -match '/include/help/[^/]+/help_export_server[.]php$') { return $true }
+    if ($preview -match '(?i)[''"]password[''"]\s*=>\s*[''"]images/(?:lock|password)[.](?:png|svg)[''"]') { return $true }
+    if ($preview -match '(?i)[''"]token[''"]\s*=>\s*[''"](?:files_repo_installed|skip_login_help_dialog|status_monitor_fields|event_fields|progress_update|progress_update_status|snmp_translations)[''"]') { return $true }
+    if ($preview -match '(?i)\$[a-z_]*(?:password|passwd|pwd|pass)[a-z_]*\s*=\s*(?:\([^)]*\)\s*)?(?:get_parameter|io_(?:input|output)_password|io_safe_output|db_get_value_sql)\s*\(') { return $true }
+
+    if ($p -match '/include/class/consolesupervisor[.]php$' -and
+        ($preview -match '(?i)admin_with_default_pass' -or
+         $preview -match '1da7ee7d45b96d0e1f45ee4ee23da560' -or
+         $preview -match '(?i)\$2y\$10\$Wv/xoxjI2VAkthJhk/Pzee')) { return $true }
+    return $false
+}
+
 function Test-CleanExamplePath { param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     $p = $Path.Replace('\','/').ToLowerInvariant()
     return ($p -match '(?:^|[._-])(?:sample|dist|example|template)(?:[._-]|$)' -or
-            $p -match '/(?:examples?|samples?|templates?)/')
+            $p -match '/(?:examples?|samples?|templates?)/' -or
+            $p -match '/pandora_console/extras/sample_login[.]php$')
 }
 
 function Test-CleanContextPath { param([string]$Path)
@@ -3759,6 +3797,7 @@ function Test-CleanNoiseFinding { param([object]$Finding)
     return ((Test-CleanCommentedFinding -Finding $Finding) -or
             (Test-CleanExamplePath -Path $Finding.Path) -or
             (Test-CleanContextPath -Path $Finding.Path) -or
+            (Test-CleanPandoraSourceNoise -Finding $Finding) -or
             (Test-CleanRuntimeReferenceFinding -Finding $Finding) -or
             $Finding.Preview -match '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]')
 }
@@ -3823,6 +3862,7 @@ function Test-CleanNoiseInterest {
         ($Finding.Category -eq 'high_value_file' -or $Finding.Category -eq 'CREDENTIAL_LEAD/zip_container')) { return $true }
     if ($Finding.Category -ne 'high_value_file') { return $false }
     $p = $Finding.Path.Replace('\','/').ToLowerInvariant()
+    if ($p -match '/pandora_console/(?:include/functions_events[.]php[.]orig|mobile/include/style/main[.]css[.]old)$') { return $true }
     # Prefer a specific classification (for example browser_credentials) over
     # the generic extension-based high_value_file entry for the same path.
     if ($SpecificPaths -and $SpecificPaths.Contains($Finding.Path)) { return $true }
@@ -3918,6 +3958,7 @@ function Write-CleanSummary {
         ((Test-CleanCommentedFinding -Finding $_) -or
          (Test-CleanExamplePath -Path $_.Path) -or
          (Test-CleanContextPath -Path $_.Path)) -and
+        -not (Test-CleanPandoraSourceNoise -Finding $_) -and
         -not $localizationCatalogNoise.Contains($_) -and
         -not (Test-CleanNoisePath -Path $_.Path) -and
         $_.Preview -notmatch '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]'

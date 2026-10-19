@@ -555,6 +555,14 @@ CRED_PATTERNS=(
     # so the well-known prefixes keep their specific label.
     'prefixed_password|[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?([\\]+"|[^[:space:]"#$<>{}]){3,}'
 
+    # Pandora FMS uses whitespace-delimited directives (rather than key=value)
+    # in pandora_server.conf / pandora_agent.conf. classify_line() restricts
+    # this signature to those product files so it cannot affect other services.
+    'pandora_config_secret|^[[:space:]]*(dbpass|ha_dbpass|console_pass|encryption_passphrase|server_pwd|server_password|proxy_pass(word)?|password)[[:space:]]+['"'"'"]?[^[:space:]#'"'"'"]{3,}'
+    # The generated Web Console config stores the live DB password and the
+    # optional credential-store encryption passphrase in PHP array entries.
+    'pandora_console_config_secret|\$config\[['"'"'"](dbpass|encryption_passphrase)['"'"'"]\][[:space:]]*=[[:space:]]*['"'"'"][^'"'"'"]{3,}['"'"'"]'
+
     # ── Connection-string passwords (SQL Server / .NET / JDBC / generic) ─
     # Allow arbitrary content (incl. semicolons) between the server= clause
     # and the password= clause — a real connection string has the form
@@ -1561,6 +1569,22 @@ classify_line() {
         if [[ "$content" =~ $regex ]]; then
             # Save this immediately: later regex helpers overwrite BASH_REMATCH.
             matched_text="${BASH_REMATCH[0]}"
+            if [ "$label" = "pandora_config_secret" ]; then
+                local pandora_path="${file//\\//}"
+                pandora_path="${pandora_path,,}"
+                case "$pandora_path" in
+                    */etc/pandora/pandora_server.conf|*/etc/pandora/pandora_agent.conf) ;;
+                    *) continue ;;
+                esac
+            fi
+            if [ "$label" = "pandora_console_config_secret" ]; then
+                local pandora_console_path="${file//\\//}"
+                pandora_console_path="${pandora_console_path,,}"
+                case "$pandora_console_path" in
+                    */pandora_console/include/config.php) ;;
+                    *) continue ;;
+                esac
+            fi
             encrypted_secret_value_line "$content" && return 1
             # nocasematch is enabled for the shared pattern library, but an
             # environment variable must actually be uppercase. Revalidate this
@@ -1651,7 +1675,7 @@ classify_line() {
                         case-sensitive|not-available|not-disclosed|stored-securely|shown-below|shown-above|configured-below|configured-above) return 1 ;;
                     esac
                     ;;
-                drupal_password|php_array_secret|wp_db_password)
+                drupal_password|php_array_secret|wp_db_password|pandora_console_config_secret)
                     if [[ "$content" =~ .*[\'\"]([^\'\"]+)[\'\"][^\'\"]*$ ]]; then
                         value="${BASH_REMATCH[1]}"
                     fi
@@ -2459,6 +2483,7 @@ check_misc_services() {
              /etc/snmp/snmpd.conf /etc/snmp/snmptrapd.conf \
              /etc/nagios/htpasswd.users /etc/icinga2/conf.d/*.conf \
              /etc/zabbix/zabbix_agentd.conf /etc/zabbix/zabbix_server.conf \
+             /etc/pandora/pandora_server.conf /etc/pandora/pandora_agent.conf \
              /etc/proxychains.conf /etc/proxychains4.conf \
              /etc/rsyncd.conf /etc/rsyncd.secrets \
              /etc/security/opasswd /etc/sssd/sssd.conf /etc/sssd/conf.d/* \
@@ -3275,7 +3300,8 @@ prepare_clean_high() {
         }
         function example_path(q) {
             return q ~ /(^|[._-])(sample|dist|example|template)([._-]|$)/ ||
-                   q ~ /\/(examples?|samples?|templates?)\//
+                   q ~ /\/(examples?|samples?|templates?)\// ||
+                   q ~ /\/pandora_console\/extras\/sample_login[.]php$/
         }
         function contextual_path(q) {
             return q ~ /\/(tests?|testdata|fixtures?)\// ||
@@ -3319,6 +3345,33 @@ prepare_clean_high() {
             if (tolower(preview) ~ /(type[[:space:]]*=[>:]?[[:space:]]*[\047\042]password[\047\042]|[\047\042]password[\047\042][[:space:]]*:[[:space:]]*[\047\042]text[\047\042])/) return 1
             return 0
         }
+        function pandora_source_noise(label, p, preview, q, r) {
+            q=tolower(p)
+            gsub(/[\\]/, "/", q)
+            if (q !~ /\/pandora_console\//) return 0
+            r=tolower(preview)
+
+            # Bundled JS libraries, help text and the shipped autologin sample
+            # are product source/examples, not host-specific credentials.
+            if (q ~ /\/include\/graphs\/flot\/jquery[.]js$/ ||
+                q ~ /\/include\/javascript\/jquery[.]js$/ ||
+                q ~ /\/mobile\/include\/javascript\/jquery[.]mobile[^\/]*[.]js$/ ||
+                q ~ /\/include\/help\/[^\/]+\/help_export_server[.]php$/) return 1
+            # Pandora source uses these names for UI assets, configuration-row
+            # identifiers and runtime getters. None of them is a literal secret.
+            if (r ~ /[\047\042]password[\047\042][[:space:]]*=>[[:space:]]*[\047\042]images\/(lock|password)[.](png|svg)[\047\042]/) return 1
+            if (r ~ /[\047\042]token[\047\042][[:space:]]*=>[[:space:]]*[\047\042](files_repo_installed|skip_login_help_dialog|status_monitor_fields|event_fields|progress_update|progress_update_status|snmp_translations)[\047\042]/) return 1
+            if (r ~ /[$][a-z_]*(password|passwd|pwd|pass)[a-z_]*[[:space:]]*=[[:space:]]*(\([^)]*\)[[:space:]]*)?(get_parameter|io_(input|output)_password|io_safe_output|db_get_value_sql)[[:space:]]*\(/) return 1
+
+            # Published hashes used solely to test whether admin still has the
+            # stock password are constants in ConsoleSupervisor, not recovered
+            # host credentials.
+            if (q ~ /\/include\/class\/consolesupervisor[.]php$/ &&
+                (r ~ /admin_with_default_pass/ ||
+                 r ~ /1da7ee7d45b96d0e1f45ee4ee23da560/ ||
+                 r ~ /[$]2y[$]10[$]wv\/xoxji2vakthjhkpzee/)) return 1
+            return 0
+        }
         function noisy(p, preview, q, r) {
             q=tolower(p)
             r=tolower(preview)
@@ -3352,7 +3405,8 @@ prepare_clean_high() {
             # those are labels even when a key exists in only one locale.
             if (cluster != "" && (index(cluster, "\034l_") > 0 ||
                                   (files[cluster] >= 3 && values[cluster] >= 2))) next
-            if ($1 !~ /^privileged_log\// && !noisy($2, $4) && !runtime_reference($1, $4)) print
+            if ($1 !~ /^privileged_log\// && !noisy($2, $4) &&
+                !pandora_source_noise($1, $2, $4) && !runtime_reference($1, $4)) print
         }
     ' "$HIGH_FILE" "$HIGH_FILE" | sort -u >"$out"
 }
@@ -3430,16 +3484,37 @@ prepare_clean_commented() {
         }
         function example_path(q) {
             return q ~ /(^|[._-])(sample|dist|example|template)([._-]|$)/ ||
-                   q ~ /\/(examples?|samples?|templates?)\//
+                   q ~ /\/(examples?|samples?|templates?)\// ||
+                   q ~ /\/pandora_console\/extras\/sample_login[.]php$/
         }
         function contextual_path(q) {
             return q ~ /\/(tests?|testdata|fixtures?|third_party|bower_components)\// ||
                    q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
                    q ~ /\/framework\/(gii|cli\/views\/webapp)\//
         }
+        function pandora_source_noise(p, preview, q, r) {
+            q=tolower(p)
+            gsub(/[\\]/, "/", q)
+            if (q !~ /\/pandora_console\//) return 0
+            r=tolower(preview)
+            if (q ~ /\/include\/graphs\/flot\/jquery[.]js$/ ||
+                q ~ /\/include\/javascript\/jquery[.]js$/ ||
+                q ~ /\/mobile\/include\/javascript\/jquery[.]mobile[^\/]*[.]js$/ ||
+                q ~ /\/include\/help\/[^\/]+\/help_export_server[.]php$/) return 1
+            if (r ~ /[\047\042]password[\047\042][[:space:]]*=>[[:space:]]*[\047\042]images\/(lock|password)[.](png|svg)[\047\042]/) return 1
+            if (r ~ /[\047\042]token[\047\042][[:space:]]*=>[[:space:]]*[\047\042](files_repo_installed|skip_login_help_dialog|status_monitor_fields|event_fields|progress_update|progress_update_status|snmp_translations)[\047\042]/) return 1
+            if (r ~ /[$][a-z_]*(password|passwd|pwd|pass)[a-z_]*[[:space:]]*=[[:space:]]*(\([^)]*\)[[:space:]]*)?(get_parameter|io_(input|output)_password|io_safe_output|db_get_value_sql)[[:space:]]*\(/) return 1
+            if (q ~ /\/include\/class\/consolesupervisor[.]php$/ &&
+                (r ~ /admin_with_default_pass/ ||
+                 r ~ /1da7ee7d45b96d0e1f45ee4ee23da560/ ||
+                 r ~ /[$]2y[$]10[$]wv\/xoxji2vakthjhkpzee/)) return 1
+            return 0
+        }
         {
             q=tolower($2); r=tolower($4)
-            if (!noisy_path(q) && (commented(r) || example_path(q) || contextual_path(q)) && r !~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/) {
+            if (!noisy_path(q) && !pandora_source_noise($2, $4) &&
+                (commented(r) || example_path(q) || contextual_path(q)) &&
+                r !~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/) {
                 sub(/^[^/]+\//, "", $1)
                 if (example_path(q)) $1="example/" $1
                 else if (contextual_path(q)) $1="context/" $1
@@ -3490,6 +3565,7 @@ prepare_clean_interest() {
                  q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
                  q ~ /\/framework\/(gii|cli\/views\/webapp)\//)) return 1
             if (cat != "high_value_file") return 0
+            if (q ~ /\/pandora_console\/(include\/functions_events[.]php[.]orig|mobile\/include\/style\/main[.]css[.]old)$/) return 1
             # A specific detector (browser store, encrypted lead, etc.) is more
             # informative than the generic extension-based classification.
             if (special[q]) return 1
