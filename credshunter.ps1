@@ -3860,8 +3860,21 @@ function Test-CleanNoiseInterest {
     if (Test-CleanNoisePath -Path $Finding.Path -IncludePackageCaches) { return $true }
     if ((Test-CleanContextPath -Path $Finding.Path) -and
         ($Finding.Category -eq 'high_value_file' -or $Finding.Category -eq 'CREDENTIAL_LEAD/zip_container')) { return $true }
-    if ($Finding.Category -ne 'high_value_file') { return $false }
     $p = $Finding.Path.Replace('\','/').ToLowerInvariant()
+
+    # Edge ships many SQLite databases inside User Data and ZIP-compatible
+    # MSIX payloads inside its installed application trees. Magic-byte
+    # inspection correctly identifies their formats, but the generic leads
+    # obscure the credential-specific Login Data / Local State entries added
+    # by Test-BrowserCredFiles. Suppress only those generic Edge findings in
+    # clean mode; full output still retains the complete evidence.
+    $isEdgeUserData = $p -match '/appdata/local/microsoft/edge/user data/'
+    if ($isEdgeUserData -and
+        $Finding.Category -in @('CREDENTIAL_LEAD/sqlite_container','high_value_file')) { return $true }
+    if ($Finding.Category -eq 'CREDENTIAL_LEAD/zip_container' -and
+        $p -match '/program files(?: [(]x86[)])?/microsoft/(?:edge|edgecore|edgewebview)/') { return $true }
+
+    if ($Finding.Category -ne 'high_value_file') { return $false }
     if ($p -match '/pandora_console/(?:include/functions_events[.]php[.]orig|mobile/include/style/main[.]css[.]old)$') { return $true }
     # Prefer a specific classification (for example browser_credentials) over
     # the generic extension-based high_value_file entry for the same path.

@@ -2304,6 +2304,12 @@ check_home_dotfiles() {
     done < <(find /root /home -maxdepth 6 -type f \( \
         -path '*/.config/google-chrome/*/Login Data' \
         -o -path '*/.config/chromium/*/Login Data' \
+        -o -path '*/.config/microsoft-edge/*/Login Data' \
+        -o -path '*/.config/microsoft-edge-beta/*/Login Data' \
+        -o -path '*/.config/microsoft-edge-dev/*/Login Data' \
+        -o -path '*/.config/microsoft-edge/Local State' \
+        -o -path '*/.config/microsoft-edge-beta/Local State' \
+        -o -path '*/.config/microsoft-edge-dev/Local State' \
         -o -path '*/.mozilla/firefox/*/key4.db' \
         -o -path '*/.mozilla/firefox/*/key3.db' \
         -o -path '*/.mozilla/firefox/*/logins.json' \
@@ -3564,6 +3570,16 @@ prepare_clean_interest() {
                 (q ~ /\/(tests?|testdata|fixtures?|third_party|bower_components)\// ||
                  q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
                  q ~ /\/framework\/(gii|cli\/views\/webapp)\//)) return 1
+            # Microsoft Edge profiles contain many ordinary SQLite databases.
+            # Keep Login Data / Local State through the specific detector above,
+            # but remove generic database-format duplicates from clean output.
+            if (q ~ /\/[.]config\/microsoft-edge(-beta|-dev)?\// &&
+                (cat == "high_value_file" || cat == "CREDENTIAL_LEAD/sqlite_container")) return 1
+            # Official Linux packages live below /opt/microsoft/msedge*. Any
+            # ZIP-format payload there is installed application data, not a
+            # user-supplied credential archive.
+            if (cat == "CREDENTIAL_LEAD/zip_container" &&
+                q ~ /^\/opt\/microsoft\/msedge(-beta|-dev)?\//) return 1
             if (cat != "high_value_file") return 0
             if (q ~ /\/pandora_console\/(include\/functions_events[.]php[.]orig|mobile\/include\/style\/main[.]css[.]old)$/) return 1
             # A specific detector (browser store, encrypted lead, etc.) is more
