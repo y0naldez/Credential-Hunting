@@ -296,7 +296,7 @@ EOF
 # -- Stage 2 -- confirmed credential containers (match alone = [CRITICAL]) ----
 STAGE2_EXTENSIONS=(
     kdbx kdb psafe3 agilekeychain opvault 1pif 1pux lpdb enpass enpassdb
-    bitwarden_export ppk pfx p12 pvk jks keystore truststore bek fve keytab
+    bitwarden_export ppk pfx p12 pvk jks keystore truststore bek fve keytab kirbi
     dpapimk
 )
 ENCRYPTED_LEAD_EXTENSIONS=(
@@ -319,7 +319,7 @@ STAGE3_EXTENSIONS=(
     # Kerberos (also in STAGE2_EXTENSIONS — Stage 3 runtime dedups
     # against Stage 2 findings, so this is harmless duplication kept for
     # discoverability when editing this file)
-    keytab
+    keytab kirbi
     # Shell scripts
     sh bash
     # Backup / scratch / saved variants

@@ -812,7 +812,7 @@ $script:Stage2Extensions = @(
     '.lpdb','.enpass','.enpassdb','.bitwarden_export'
     '.ppk','.pfx','.p12','.pvk'
     '.jks','.keystore','.truststore'
-    '.bek','.fve','.keytab','.dpapimk'
+    '.bek','.fve','.keytab','.kirbi','.dpapimk'
 )
 $script:EncryptedLeadExtensions = @(
     '.axx','.enc','.encrypted','.aes','.gpg','.pgp'
@@ -834,7 +834,7 @@ $script:Stage3Extensions = @(
     '.env','.envrc'
     # Kerberos (also in $script:Stage2Extensions -- Stage 3 runtime dedups
     # against Stage 2 findings, harmless duplication kept for discoverability)
-    '.keytab'
+    '.keytab','.kirbi'
     # Shell scripts
     '.sh','.bash'
     # Backup / scratch / saved variants
@@ -1850,9 +1850,14 @@ function Invoke-ReferenceExtraction {
 function Test-ShortcutCredentialTarget { param([string]$Target)
     if ([string]::IsNullOrWhiteSpace($Target)) { return $false }
     if (@(Get-ServiceCommandCredential -CommandLine $Target).Count -gt 0) { return $true }
+    # A PuTTY-family shortcut commonly represents a saved remote-login
+    # session even when its command line contains no literal password. Keep it
+    # as a review lead so the operator can inspect the saved session, target,
+    # username and related registry state.
+    if ($Target -match '(?i)(?:^|[\\/])(?:putty|kitty|plink)(?:\.exe)?(?:\s|$)') { return $true }
     if ($Target -match '(?i)\b(?:cmdkey|runas|net\s+use|psexec|wmic|schtasks|sshpass|plink)\b.*(?:pass|/p:|-pw\b|-p\s+)') { return $true }
     if ($Target -match '(?i)(?:^|[\\/])[^\\/]*(?:credential|secret|password|passwd)[^\\/]*(?:\s|$)') { return $true }
-    if ($Target -match '(?i)\.(?:kdbx?|psafe3|ppk|pfx|p12|pvk|keytab|bek|dpapimk|env|netrc|pgpass)(?:\s|$)') { return $true }
+    if ($Target -match '(?i)\.(?:kdbx?|psafe3|ppk|pfx|p12|pvk|keytab|kirbi|bek|dpapimk|env|netrc|pgpass)(?:\s|$)') { return $true }
     # Preserve links (or Notepad/editor arguments) that point to content the
     # scanner can actually inspect. The destination does not need a suspicious
     # name: notes.txt or an ordinary app.config may still hold a password.

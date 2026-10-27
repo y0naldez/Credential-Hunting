@@ -13,7 +13,7 @@ No intenta autenticarse, no realiza password spraying, no explota servicios, no 
 
 ```text
 Stage 1   Sistema y usuarios       registro, servicios, historiales, buzones, archivos ocultos, vaults y sesiones
-Stage 2   Contenedores             kdbx, ppk, pfx, keytab, axx, enc, gpg y archivos renombrados
+Stage 2   Contenedores             kdbx, ppk, pfx, keytab, kirbi, axx, enc, gpg y archivos renombrados
 Stage 3   Archivos de alto valor   llaves, .env, respaldos, bases de datos, capturas y configs
 Stage 4   Nombres sospechosos      password, secret, credential, backup, vault, etc.
 Stage 5   Contenido                patrones para credenciales reutilizables y secretos cifrados
@@ -27,7 +27,7 @@ Stage 1 comprueba ubicaciones conocidas del sistema y aplicaciones. Las etapas 2
 |---|---|
 | Credenciales directas | `password=...`, frases como `the password is "..."` o `the pass was Summer2024`, cadenas de conexión, basic auth, comandos e historiales, propiedades SQL y `INSERT` multirregistro correlacionados por columna |
 | Hallazgos en servicios de Windows | Credenciales hardcodeadas en `ImagePath`, argumentos, URLs o valores de texto bajo `Parameters`; las cuentas de servicio no integradas se conservan como leads para revisión |
-| Material de autenticación | Llaves SSH/PuTTY, PFX/P12, keytabs, SAM/SYSTEM y GPP `cpassword` |
+| Material de autenticación | Llaves SSH/PuTTY, PFX/P12, keytabs, tickets Kerberos `.kirbi`, SAM/SYSTEM y GPP `cpassword` |
 | Contenedores | KeePass, `.axx`, `.enc`, `.gpg`, `.pgp` y archivos comprimidos renombrados |
 | Secretos cifrados | Bloques con formato de vault, valores cifrados estructurados y datos secretos sellados o gestionados por aplicaciones |
 | Referencias | Rutas encontradas en historiales, accesos directos, sesiones y workspaces |

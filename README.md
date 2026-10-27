@@ -25,7 +25,7 @@ A staged funnel narrows from known credential locations to suspicious files and 
 
 ```text
  Stage 1   OS and user artifacts      registry, services, histories, mailboxes, hidden files, vaults, sessions
- Stage 2   Credential containers      kdbx, ppk, pfx, keytab, axx, enc, gpg, renamed archives
+ Stage 2   Credential containers      kdbx, ppk, pfx, keytab, kirbi, axx, enc, gpg, renamed archives
  Stage 3   High-value file types      keys, env files, backups, DBs, captures, configs
  Stage 4   Suspicious filenames       password, secret, credential, backup, vault
  Stage 5   Content scan               tuned regexes for reusable credentials and encrypted leads
@@ -39,7 +39,7 @@ CredsHunter focuses on local, reusable, or investigation-worthy credential mater
 |---|---|
 | Direct credentials | `password=...`, prose such as `the password is "..."` or `the pass was Summer2024`, connection strings, basic auth URLs, Windows service command lines, WinRM/Impacket commands, PHP arrays, PHP `define()`, DB connect calls, SQL property stores and column-aware multi-row inserts |
 | Windows service findings | Hardcoded credentials in service `ImagePath`, command-line arguments, URLs, or string values under `Parameters`; non-built-in service accounts are retained as review leads |
-| Private keys and auth material | SSH keys, PuTTY keys, PFX/P12, keytabs, SAM/SYSTEM hives, GPP `cpassword` |
+| Private keys and auth material | SSH keys, PuTTY keys, PFX/P12, keytabs, Kerberos `.kirbi` tickets, SAM/SYSTEM hives, GPP `cpassword` |
 | Credential containers | KeePass `.kdbx`, encrypted archives, `.axx`, `.enc`, `.gpg`, `.pgp`, renamed ZIP/7z/RAR/GZip/TAR files |
 | Encrypted credential leads | Vault-formatted encrypted blocks, structured encrypted values, and sealed or application-managed secret data |
 | Reference leads | Paths found in histories, recent files, shortcuts, editor sessions, and workspace files |
