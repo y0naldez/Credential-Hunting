@@ -80,6 +80,15 @@ being treated as confirmed passwords.
 Passwords managed normally by the Service Control Manager are stored as
 protected LSA secrets, so CredsHunter does not attempt to extract them.
 
+### Previous Windows Installation
+
+Stage 1 performs a constant-time check for an offline `SAM` and `SYSTEM` pair
+under `Windows.old\Windows\System32\config` or directly under
+`Windows.old\Windows\System32`. When both files exist and can be opened for reading, it reports
+`CREDENTIAL_LEAD/windows_old_sam_system`. This is an investigation lead, not a
+claim that credentials were recovered: CredsHunter does not copy, parse, or
+extract either hive.
+
 ## Natural-Language Passwords
 
 Both engines recognize common ways people write credentials in notes, command

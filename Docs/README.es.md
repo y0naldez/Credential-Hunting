@@ -66,6 +66,16 @@ Stage 1 revisa `ImagePath`, `ObjectName` y los valores de texto de la subclave `
 
 Las contraseñas configuradas normalmente mediante el Service Control Manager se almacenan como secretos LSA protegidos. CredsHunter no intenta extraerlas y no debe interpretarse una cuenta de servicio como prueba de que su contraseña esté disponible en texto claro.
 
+### Instalación anterior de Windows
+
+Stage 1 realiza una comprobación rápida y no recursiva del par offline `SAM` y
+`SYSTEM`, tanto bajo `Windows.old\Windows\System32\config` como directamente en
+`Windows.old\Windows\System32`. Cuando ambos archivos existen y pueden abrirse
+en modo lectura, genera
+`CREDENTIAL_LEAD/windows_old_sam_system`. Es una vía potencial para continuar
+la investigación, no una confirmación de credenciales: CredsHunter no copia,
+procesa ni extrae ninguno de los hives.
+
 ## Contraseñas en lenguaje natural
 
 Ambos motores reconocen formas comunes de escribir credenciales en notas,

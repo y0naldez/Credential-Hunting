@@ -2780,6 +2780,72 @@ function Test-SAMHives {
     }
 }
 
+function Test-WindowsOldHivePair {
+    Write-Info "Stage 1.10a - Windows.old offline SAM/SYSTEM pair"
+
+    # A previous Windows installation is only a lead when both registry hives
+    # needed for offline local-account secret recovery are present and readable.
+    # This check deliberately does not copy, parse, or extract either hive.
+    $roots = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+
+    if ($env:SystemDrive) {
+        [void]$roots.Add((Join-Path $env:SystemDrive 'Windows.old'))
+    }
+
+    # Also support an explicitly supplied offline/mounted drive or fixture. The
+    # checks are constant-time path probes; Windows.old is never walked here.
+    foreach ($requestedPath in $Path) {
+        try {
+            $absolute = [System.IO.Path]::GetFullPath($requestedPath)
+            $itemName = [System.IO.Path]::GetFileName($absolute.TrimEnd('\','/'))
+            if ($itemName -eq 'Windows.old') {
+                [void]$roots.Add($absolute.TrimEnd('\','/'))
+            }
+            $driveRoot = [System.IO.Path]::GetPathRoot($absolute)
+            if ($driveRoot) { [void]$roots.Add((Join-Path $driveRoot 'Windows.old')) }
+            if (Test-Path -LiteralPath $absolute -PathType Container) {
+                [void]$roots.Add((Join-Path $absolute 'Windows.old'))
+            }
+        } catch {}
+    }
+
+    foreach ($oldRoot in $roots) {
+        # Most installations keep the hives in System32\config, but some
+        # Windows.old layouts expose the copied SAM and SYSTEM directly under
+        # System32. Prefer the standard location and emit at most one lead.
+        foreach ($hiveRoot in @(
+            (Join-Path $oldRoot 'Windows\System32\config')
+            (Join-Path $oldRoot 'Windows\System32')
+        )) {
+            $sam = Join-Path $hiveRoot 'SAM'
+            $system = Join-Path $hiveRoot 'SYSTEM'
+            if (-not (Test-Path -LiteralPath $sam -PathType Leaf) -or
+                -not (Test-Path -LiteralPath $system -PathType Leaf)) { continue }
+
+            $samReadable = $false
+            $systemReadable = $false
+            try {
+                $stream = [System.IO.File]::Open($sam, 'Open', 'Read', 'ReadWrite')
+                $stream.Dispose()
+                $samReadable = $true
+            } catch {}
+            try {
+                $stream = [System.IO.File]::Open($system, 'Open', 'Read', 'ReadWrite')
+                $stream.Dispose()
+                $systemReadable = $true
+            } catch {}
+
+            if ($samReadable -and $systemReadable) {
+                Add-Checked -Label 'windows_old_hive_pair' -Path $oldRoot
+                Add-Interesting -Category 'CREDENTIAL_LEAD/windows_old_sam_system' `
+                    -Path ("SAM={0} | SYSTEM={1} (both readable; offline analysis may be possible)" -f $sam, $system)
+                break
+            }
+        }
+    }
+}
+
 function Test-IISConfigs {
     Write-Info "Stage 1.11 - IIS web.config / applicationHost.config"
     foreach ($f in @(
@@ -3413,6 +3479,7 @@ function Invoke-SystemChecks {
     Invoke-Stage1Check { Test-VNCRegistry }
     Invoke-Stage1Check { Test-SNMPRegistry }
     Invoke-Stage1Check { Test-SAMHives }
+    Invoke-Stage1Check { Test-WindowsOldHivePair }
     Invoke-Stage1Check { Test-IISConfigs }
     Invoke-Stage1Check { Test-ScheduledTasks }
     Invoke-Stage1Check { Test-WiFiProfiles }
