@@ -80,6 +80,34 @@ being treated as confirmed passwords.
 Passwords managed normally by the Service Control Manager are stored as
 protected LSA secrets, so CredsHunter does not attempt to extract them.
 
+### PuTTY and saved Windows sessions
+
+The PowerShell scanner inspects PuTTY and KiTTY sessions in `HKCU` and every
+loaded `HKEY_USERS` hive. It supports both the standard
+`Sessions\name\RemoteCommand` layout and lab/tool variants that store a session
+as a value directly on the `Sessions` key. Commands containing `plink -pw`,
+password switches, `sshpass`, or URL userinfo are reported as `HIGH` with the
+stored command visible. `cmdkey /list` entries are retained as review metadata,
+not reusable credentials, because that command does not expose the password.
+
+The same stage covers the surrounding saved-credential ecosystem:
+
+- WinSCP registry sessions in every loaded user hive plus common `WinSCP.ini`
+  locations. Passwords without a WinSCP master password are decoded; protected
+  values remain encrypted leads.
+- mRemoteNG `confCons.xml` files in every local profile. Legacy AES-CBC and
+  modern AES-GCM values using the default `mR3m` key are recovered; custom-key
+  files remain encrypted leads.
+- SuperPuTTY legacy registry sessions and `Sessions.XML`, including plaintext
+  `-pw` values inside `ExtraArgs`.
+- Running Pageant agents, `.ppk` paths present on their command lines, and PPK
+  files in common profile locations. Keys loaded interactively with no retained
+  filename are reported as an active agent, not falsely claimed as extracted.
+- Windows Credential Manager through locale-independent `CredEnumerate`.
+  Printable blobs exposed to the current logon are `HIGH`; metadata-only and
+  DPAPI-protected entries remain review leads. No connection or `runas` command
+  is executed.
+
 ### Previous Windows Installation
 
 Stage 1 performs a constant-time check for an offline `SAM` and `SYSTEM` pair
@@ -207,6 +235,11 @@ the same key appears with different translations across at least three sibling
 language files. Isolated values remain visible. `NOISE_SUPPRESSED` reports how
 many raw items were omitted from that view. Full mode retains those raw matches
 for exhaustive review.
+
+On Windows, clean mode also removes installed Cloudbase-Init Python library
+source, cached copies of CredsHunter itself, OneDrive telemetry/log containers,
+Edge application MSIX payloads, icon caches, executable `.old` files, and
+OneDrive `general.keystore` log state. These remain available in full mode.
 
 Clean mode also removes non-literal runtime references such as shell credential
 variables, password getter/hash calls, and password-field UI metadata from the

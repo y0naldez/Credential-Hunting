@@ -31,7 +31,7 @@ export LC_ALL=C   # consistent regex / sort behavior regardless of host locale
 # miss content like "Password=..." even though grep -i finds it.
 shopt -s nocasematch 2>/dev/null || true
 
-VERSION="2.5.0"
+VERSION="2.6.0"
 
 # Pre-initialise color vars so `err()` and friends work BEFORE setup_colors
 # runs (e.g. when parse_args reports a bad flag).

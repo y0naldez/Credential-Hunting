@@ -66,6 +66,23 @@ Stage 1 revisa `ImagePath`, `ObjectName` y los valores de texto de la subclave `
 
 Las contraseñas configuradas normalmente mediante el Service Control Manager se almacenan como secretos LSA protegidos. CredsHunter no intenta extraerlas y no debe interpretarse una cuenta de servicio como prueba de que su contraseña esté disponible en texto claro.
 
+### PuTTY y credenciales guardadas de Windows
+
+Stage 1 revisa sesiones PuTTY y KiTTY en `HKCU` y en todos los hives de usuario
+cargados, incluidas las variantes que guardan el comando remoto directamente
+como valor de `Sessions`. También cubre sesiones WinSCP en registro e INI,
+configuraciones `confCons.xml` de mRemoteNG, sesiones SuperPuTTY en registro y
+`Sessions.XML`, referencias a llaves `.ppk` de Pageant y Windows Credential
+Manager mediante `CredEnumerate`.
+
+Los valores WinSCP sin contraseña maestra y los secretos mRemoteNG AES-CBC/GCM
+protegidos con la clave predeterminada `mR3m` se recuperan como hallazgos
+reutilizables. Los valores protegidos con contraseña maestra, DPAPI o una clave
+personalizada se mantienen como pistas cifradas. Las llaves cargadas en Pageant
+sin una ruta conservada se reportan como agente activo, sin afirmar que fueron
+extraídas. Todas estas comprobaciones son de sólo lectura: no se inicia ninguna
+conexión ni se ejecuta `runas`.
+
 ### Instalación anterior de Windows
 
 Stage 1 realiza una comprobación rápida y no recursiva del par offline `SAM` y
