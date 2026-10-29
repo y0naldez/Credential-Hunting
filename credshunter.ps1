@@ -3820,11 +3820,37 @@ function Test-CleanRuntimeReferenceFinding { param([object]$Finding)
     if ($rhs -match '(?i)->\s*(?:get|read|load|fetch)\w*(?:password|passwd|passphrase|pwd|secret)\w*\s*\(') { return $true }
     if ($rhs -match '(?i)(?:^|[^A-Za-z0-9_])(?:substitute_vars|hash_password|get_user_password)\s*\(') { return $true }
     if ($rhs -match '(?i)(?:^|::|->)(?:get_input_string|get_instance|get)\s*\(') { return $true }
+    # Source-code expressions that describe or transform a password variable
+    # are not reusable credentials. These forms are common in Joomla's update
+    # extractor and media manager.
+    if ($preview -match '(?i)^\s*\$?(?:[A-Za-z_]\w*)?(?:password|passwd|pwd)\w*\s*=\s*!is_(?:string|scalar)\s*\(') { return $true }
+    if ($preview -match '(?i)\b(?:password|passwd|pwd)\s*\?\s*[''"]') { return $true }
+    if ($preview -match '(?i)^\s*(?:[''"][^''"]*(?:password|passwd|pwd)[^''"]*[''"]|(?:[A-Za-z_]\w*)?(?:password|passwd|pwd)\w*)\s*(?:=>|:)\s*[''"]?\$[A-Za-z_]\w*[''"]?\s*[,;]?$') { return $true }
+    if ($preview -match '(?i)^\s*(?:[A-Za-z_]\w*)?(?:password|passwd|pwd)\w*\s*:\s*[A-Za-z_]\w*\s*\(') { return $true }
     if ($preview -match '(?i)\$?[A-Za-z_]\w*(?:password|passwd|pwd)\w*\s*={2,3}') { return $true }
     if ($preview -match '(?i)^\s*const\s+(?:error_|ldap_)\w*(?:password|passwd|pwd)') { return $true }
     if ($preview -match '(?i)[''"](?:password|passwd|pwd)[''"]\s*=>\s*[''"](?:active)?passwordfield[''"]') { return $true }
     if ($preview -match '(?i)[''"](?:password|passwd|pwd)[''"]\s*=>\s*[''"](?:text\s+not\s+null|string\()') { return $true }
     if ($preview -match '(?i)(?:type\s*=[>:]?\s*[''"]password[''"]|[''"]password[''"]\s*:\s*[''"]text[''"])') { return $true }
+    return $false
+}
+
+function Test-CleanJoomlaSourceNoise { param([object]$Finding)
+    $p = ([string]$Finding.Path).Replace('\','/').ToLowerInvariant()
+    $preview = [string]$Finding.Preview
+
+    # Joomla localization catalogs use uppercase password-shaped keys for UI
+    # labels, validation messages and translated installer prompts. They are
+    # product text, not assignments consumed by the host environment.
+    $joomlaLanguagePath = $p -match '/(?:administrator/|api/|installation/)?language/[a-z]{2,3}-[a-z]{2}/[^/]+[.]ini$'
+    if ($joomlaLanguagePath -and
+        $preview -match '^\s*[A-Z][A-Z0-9_]*\s*=\s*"') { return $true }
+
+    # Joomla ships the LDAP example value "bobby7" in both installation DB
+    # schemas. It seeds extension defaults and is not a credential for the
+    # installed site.
+    if ($p -match '/installation/sql/(?:mysql|postgresql)/base[.]sql$' -and
+        $preview -match '"username":"admin","password":"bobby7"') { return $true }
     return $false
 }
 
@@ -3870,6 +3896,7 @@ function Test-CleanNoiseFinding { param([object]$Finding)
             (Test-CleanExamplePath -Path $Finding.Path) -or
             (Test-CleanContextPath -Path $Finding.Path) -or
             (Test-CleanPandoraSourceNoise -Finding $Finding) -or
+            (Test-CleanJoomlaSourceNoise -Finding $Finding) -or
             (Test-CleanRuntimeReferenceFinding -Finding $Finding) -or
             $Finding.Preview -match '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]')
 }
@@ -3947,6 +3974,10 @@ function Test-CleanNoiseInterest {
         $p -match '/program files(?: [(]x86[)])?/microsoft/(?:edge|edgecore|edgewebview)/') { return $true }
 
     if ($Finding.Category -ne 'high_value_file') { return $false }
+    # CMS distributions commonly ship gzip-precompressed static assets for
+    # direct web-server delivery. They are not backup archives and contain the
+    # same public CSS/JS already present beside them.
+    if ($p -match '[.](?:css|js|mjs|map|svg|woff2?|ttf|eot)[.]gz$') { return $true }
     if ($p -match '/pandora_console/(?:include/functions_events[.]php[.]orig|mobile/include/style/main[.]css[.]old)$') { return $true }
     # Prefer a specific classification (for example browser_credentials) over
     # the generic extension-based high_value_file entry for the same path.
@@ -4044,6 +4075,8 @@ function Write-CleanSummary {
          (Test-CleanExamplePath -Path $_.Path) -or
          (Test-CleanContextPath -Path $_.Path)) -and
         -not (Test-CleanPandoraSourceNoise -Finding $_) -and
+        -not (Test-CleanJoomlaSourceNoise -Finding $_) -and
+        -not (Test-CleanRuntimeReferenceFinding -Finding $_) -and
         -not $localizationCatalogNoise.Contains($_) -and
         -not (Test-CleanNoisePath -Path $_.Path) -and
         $_.Preview -notmatch '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]'

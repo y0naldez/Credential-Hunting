@@ -3315,9 +3315,10 @@ prepare_clean_high() {
                    q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
                    q ~ /\/framework\/(gii|cli\/views\/webapp)\//
         }
-        function runtime_reference(label, preview, rhs, l) {
+        function runtime_reference(label, preview, rhs, l, r) {
             l=tolower(label)
             rhs=tolower(preview)
+            r=rhs
             sub(/^[^=]*=/, "", rhs)
 
             # Shell commands whose credential argument is populated entirely
@@ -3338,6 +3339,13 @@ prepare_clean_high() {
             if (rhs ~ /(^|[^A-Za-z0-9_])(substitute_vars|hash_password|get_user_password)[[:space:]]*\(/) return 1
             if (rhs ~ /(^|::|->)(get_input_string|get_instance|get)[[:space:]]*\(/) return 1
 
+            # Source expressions that only transform/reference password
+            # variables (not literal credentials). Common in Joomla core.
+            if (r ~ /^[[:space:]]*[$]?([a-z_][a-z0-9_]*)?(password|passwd|pwd)[a-z0-9_]*[[:space:]]*=[[:space:]]*!is_(string|scalar)[[:space:]]*\(/) return 1
+            if (r ~ /(password|passwd|pwd)[[:space:]]*[?][[:space:]]*[\047\042]/) return 1
+            if (r ~ /^[[:space:]]*([\047\042][^\047\042]*(password|passwd|pwd)[^\047\042]*[\047\042]|([a-z_][a-z0-9_]*)?(password|passwd|pwd)[a-z0-9_]*)[[:space:]]*(=>|:)[[:space:]]*[\047\042]?[$][a-z_][a-z0-9_]*[\047\042]?[[:space:]]*[,;]?$/) return 1
+            if (r ~ /^[[:space:]]*([a-z_][a-z0-9_]*)?(password|passwd|pwd)[a-z0-9_]*[[:space:]]*:[[:space:]]*[a-z_][a-z0-9_]*[[:space:]]*\(/) return 1
+
             # Comparisons, validation constants, schema declarations and UI
             # widget names mention password fields but do not assign reusable
             # values. These dominate installed application source trees.
@@ -3349,6 +3357,20 @@ prepare_clean_high() {
             # UI metadata toggles a field to password display mode but does not
             # contain a credential value.
             if (tolower(preview) ~ /(type[[:space:]]*=[>:]?[[:space:]]*[\047\042]password[\047\042]|[\047\042]password[\047\042][[:space:]]*:[[:space:]]*[\047\042]text[\047\042])/) return 1
+            return 0
+        }
+        function joomla_source_noise(p, preview, q) {
+            q=tolower(p)
+            gsub(/[\\]/, "/", q)
+
+            # Joomla language INI files contain translated UI labels and
+            # validation messages under password-shaped uppercase keys.
+            if (q ~ /\/(administrator\/|api\/|installation\/)?language\/[a-z][a-z][a-z]?-[a-z][a-z]\/[^\/]+[.]ini$/ &&
+                preview ~ /^[[:space:]]*[A-Z][A-Z0-9_]*[[:space:]]*=[[:space:]]*\042/) return 1
+
+            # Default LDAP example embedded in Joomla installation schemas.
+            if (q ~ /\/installation\/sql\/(mysql|postgresql)\/base[.]sql$/ &&
+                preview ~ /\042username\042:\042admin\042,\042password\042:\042bobby7\042/) return 1
             return 0
         }
         function pandora_source_noise(label, p, preview, q, r) {
@@ -3412,7 +3434,8 @@ prepare_clean_high() {
             if (cluster != "" && (index(cluster, "\034l_") > 0 ||
                                   (files[cluster] >= 3 && values[cluster] >= 2))) next
             if ($1 !~ /^privileged_log\// && !noisy($2, $4) &&
-                !pandora_source_noise($1, $2, $4) && !runtime_reference($1, $4)) print
+                !pandora_source_noise($1, $2, $4) &&
+                !joomla_source_noise($2, $4) && !runtime_reference($1, $4)) print
         }
     ' "$HIGH_FILE" "$HIGH_FILE" | sort -u >"$out"
 }
@@ -3516,9 +3539,31 @@ prepare_clean_commented() {
                  r ~ /[$]2y[$]10[$]wv\/xoxji2vakthjhkpzee/)) return 1
             return 0
         }
+        function runtime_reference(label, preview, rhs, r) {
+            rhs=tolower(preview)
+            r=rhs
+            sub(/^[^=]*=/, "", rhs)
+            if (rhs ~ /^[[:space:]]*(\([^)]*\)[[:space:]]*)?[$][A-Za-z_][A-Za-z0-9_]*(->|[.])/) return 1
+            if (rhs ~ /^[[:space:]]*(\([^)]*\)[[:space:]]*)?[$][A-Za-z_][A-Za-z0-9_]*(\[[^]]+\])?[[:space:]]*[;,]?[[:space:]]*$/) return 1
+            if (r ~ /^[[:space:]]*[$]?([a-z_][a-z0-9_]*)?(password|passwd|pwd)[a-z0-9_]*[[:space:]]*=[[:space:]]*!is_(string|scalar)[[:space:]]*\(/) return 1
+            if (r ~ /(password|passwd|pwd)[[:space:]]*[?][[:space:]]*[\047\042]/) return 1
+            if (r ~ /^[[:space:]]*([\047\042][^\047\042]*(password|passwd|pwd)[^\047\042]*[\047\042]|([a-z_][a-z0-9_]*)?(password|passwd|pwd)[a-z0-9_]*)[[:space:]]*(=>|:)[[:space:]]*[\047\042]?[$][a-z_][a-z0-9_]*[\047\042]?[[:space:]]*[,;]?$/) return 1
+            if (r ~ /^[[:space:]]*([a-z_][a-z0-9_]*)?(password|passwd|pwd)[a-z0-9_]*[[:space:]]*:[[:space:]]*[a-z_][a-z0-9_]*[[:space:]]*\(/) return 1
+            return 0
+        }
+        function joomla_source_noise(p, preview, q) {
+            q=tolower(p)
+            gsub(/[\\]/, "/", q)
+            if (q ~ /\/(administrator\/|api\/|installation\/)?language\/[a-z][a-z][a-z]?-[a-z][a-z]\/[^\/]+[.]ini$/ &&
+                preview ~ /^[[:space:]]*[A-Z][A-Z0-9_]*[[:space:]]*=[[:space:]]*\042/) return 1
+            if (q ~ /\/installation\/sql\/(mysql|postgresql)\/base[.]sql$/ &&
+                preview ~ /\042username\042:\042admin\042,\042password\042:\042bobby7\042/) return 1
+            return 0
+        }
         {
             q=tolower($2); r=tolower($4)
             if (!noisy_path(q) && !pandora_source_noise($2, $4) &&
+                !joomla_source_noise($2, $4) && !runtime_reference($1, $4) &&
                 (commented(r) || example_path(q) || contextual_path(q)) &&
                 r !~ /:\/\/\[[^]]*(password|passwd|pwd)[^]]*\]/) {
                 sub(/^[^/]+\//, "", $1)
@@ -3581,6 +3626,9 @@ prepare_clean_interest() {
             if (cat == "CREDENTIAL_LEAD/zip_container" &&
                 q ~ /^\/opt\/microsoft\/msedge(-beta|-dev)?\//) return 1
             if (cat != "high_value_file") return 0
+            # Gzip-precompressed public web assets shipped by CMS packages are
+            # not credential-bearing backup archives.
+            if (q ~ /[.](css|js|mjs|map|svg|woff|woff2|ttf|eot)[.]gz$/) return 1
             if (q ~ /\/pandora_console\/(include\/functions_events[.]php[.]orig|mobile\/include\/style\/main[.]css[.]old)$/) return 1
             # A specific detector (browser store, encrypted lead, etc.) is more
             # informative than the generic extension-based classification.
