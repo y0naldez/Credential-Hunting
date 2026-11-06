@@ -3315,6 +3315,14 @@ prepare_clean_high() {
                    q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||
                    q ~ /\/framework\/(gii|cli\/views\/webapp)\//
         }
+        function installed_python_source(q) {
+            # Only global CPython stdlib source is noise here. Project trees,
+            # virtualenvs and configuration files remain eligible.
+            return (q ~ /^\/usr\/(local\/)?lib\/python[23][.][0-9]+\// ||
+                    q ~ /^\/opt\/(python[^/]*|conda)\/lib\/python[23][.][0-9]+\// ||
+                    q ~ /\/[.]pyenv\/versions\/[23][.][0-9]+([.][0-9]+)?\/lib\/python[23][.][0-9]+\//) &&
+                   q ~ /[.](py|pyi)$/
+        }
         function runtime_reference(label, preview, rhs, l, r) {
             l=tolower(label)
             rhs=tolower(preview)
@@ -3404,6 +3412,7 @@ prepare_clean_high() {
             q=tolower(p)
             r=tolower(preview)
             return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
+                   installed_python_source(q) ||
                    q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|extensions)\// ||
                    q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                    q ~ /\/vendor\/bundle\// ||
@@ -3499,6 +3508,7 @@ prepare_clean_commented() {
     awk -F'\t' 'BEGIN { OFS="\t" }
         function noisy_path(q) {
             return q ~ /\/(node_modules|site-packages|dist-packages)\// ||
+                   installed_python_source(q) ||
                    q ~ /\/var\/lib\/gems\/[0-9.]+\/(gems|extensions)\// ||
                    q ~ /\/usr\/(local\/)?lib\/ruby\/gems\// ||
                    q ~ /\/vendor\/bundle\// ||
@@ -3507,6 +3517,12 @@ prepare_clean_commented() {
                    q ~ /[.]jar$/ ||
                    q ~ /\/usr\/share\/[^\/]+\/lib\/.*[.](zip|whl)$/ ||
                    q ~ /\/credshunter[.](sh|ps1)$/
+        }
+        function installed_python_source(q) {
+            return (q ~ /^\/usr\/(local\/)?lib\/python[23][.][0-9]+\// ||
+                    q ~ /^\/opt\/(python[^/]*|conda)\/lib\/python[23][.][0-9]+\// ||
+                    q ~ /\/[.]pyenv\/versions\/[23][.][0-9]+([.][0-9]+)?\/lib\/python[23][.][0-9]+\//) &&
+                   q ~ /[.](py|pyi)$/
         }
         function commented(r) {
             return r ~ /^[[:space:]]*(#|;|[*][[:space:]]|[/][/]|--([[:space:]]|$)|rem([[:space:]]|$)|<!--|[/][*])/
@@ -3611,6 +3627,12 @@ prepare_clean_interest() {
                 q ~ /\/credshunter[.](sh|ps1)(:|$)/ ||
                 q ~ /^\/etc\/apt\/trusted[.]gpg([.]d\/|$)/ ||
                 q ~ /^\/usr\/share\/keyrings\//) return 1
+            # Tcl encoding maps use .enc for "encoding", not ciphertext. Keep
+            # the exception exact so arbitrary encrypted files stay visible.
+            if (cat == "ENCRYPTED_CREDENTIAL_LEAD" &&
+                (q ~ /^\/usr\/share\/tcltk\/tcl[0-9.]+\/encoding\/[^/]+[.]enc$/ ||
+                 q ~ /^\/opt\/(python[^/]*|conda)\/tcl\/tcl[0-9.]+\/encoding\/[^/]+[.]enc$/ ||
+                 q ~ /\/[.]pyenv\/versions\/[23][.][0-9]+([.][0-9]+)?\/tcl\/tcl[0-9.]+\/encoding\/[^/]+[.]enc$/)) return 1
             if ((cat == "high_value_file" || cat == "CREDENTIAL_LEAD/zip_container") &&
                 (q ~ /\/(tests?|testdata|fixtures?|third_party|bower_components)\// ||
                  q ~ /\/assets\/packages\// || q ~ /\/tmp\/assets\// ||

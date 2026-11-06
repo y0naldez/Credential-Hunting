@@ -236,11 +236,6 @@ language files. Isolated values remain visible. `NOISE_SUPPRESSED` reports how
 many raw items were omitted from that view. Full mode retains those raw matches
 for exhaustive review.
 
-On Windows, clean mode also removes installed Cloudbase-Init Python library
-source, cached copies of CredsHunter itself, OneDrive telemetry/log containers,
-Edge application MSIX payloads, icon caches, executable `.old` files, and
-OneDrive `general.keystore` log state. These remain available in full mode.
-
 Clean mode also removes non-literal runtime references such as shell credential
 variables, password getter/hash calls, and password-field UI metadata from the
 directly usable section. Concrete literals remain `HIGH`. Matches from

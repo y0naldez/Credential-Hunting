@@ -4275,9 +4275,37 @@ function Test-CleanContextPath { param([string]$Path)
             $p -match '/framework/(?:gii|cli/views/webapp)/')
 }
 
+function Test-CleanInstalledPythonRuntimeNoise {
+    param([object]$Finding, [switch]$Interest)
+    if (-not $Finding -or [string]::IsNullOrWhiteSpace([string]$Finding.Path)) { return $false }
+
+    $p = ([string]$Finding.Path).Replace('\','/').ToLowerInvariant()
+    # Restrict this to recognizable CPython installation roots. A project
+    # directory merely containing "python" (including virtual environments)
+    # must remain eligible for normal clean-mode reporting.
+    $installedRoot = (
+        $p -match '(?:^|/)(?:program files(?: [(]x86[)])?|users/[^/]+/appdata/local/programs/python)/python[23](?:[.]?[0-9]{1,2})?/' -or
+        $p -match '^[a-z]:/python[23](?:[.]?[0-9]{1,2})?/'
+    )
+    if (-not $installedRoot) { return $false }
+
+    if ($Interest) {
+        # Tcl encoding maps bundled by CPython use .enc as "encoding", not
+        # "encrypted". Limit this exception to that exact runtime subtree and
+        # classification; arbitrary .enc files beside Python remain visible.
+        return (([string]$Finding.Category -eq 'ENCRYPTED_CREDENTIAL_LEAD') -and
+                $p -match '/tcl/tcl[0-9.]+/encoding/[^/]+[.]enc(?:$|[:( ])')
+    }
+
+    # Installed stdlib/source manipulates password variables and includes API
+    # examples, but is not host configuration. Full mode retains every match.
+    return ($p -match '/(?:lib|scripts)/.*[.](?:py|pyw|pyi)$')
+}
+
 function Test-CleanNoiseFinding { param([object]$Finding)
     if (Test-CleanNoisePath -Path $Finding.Path) { return $true }
     return ((Test-CleanCommentedFinding -Finding $Finding) -or
+            (Test-CleanInstalledPythonRuntimeNoise -Finding $Finding) -or
             (Test-CleanExamplePath -Path $Finding.Path) -or
             (Test-CleanContextPath -Path $Finding.Path) -or
             (Test-CleanPandoraSourceNoise -Finding $Finding) -or
@@ -4342,6 +4370,7 @@ function Test-CleanNoiseInterest {
         [System.Collections.Generic.HashSet[string]]$SpecificPaths
     )
     if (Test-CleanNoisePath -Path $Finding.Path -IncludePackageCaches) { return $true }
+    if (Test-CleanInstalledPythonRuntimeNoise -Finding $Finding -Interest) { return $true }
     if ((Test-CleanContextPath -Path $Finding.Path) -and
         ($Finding.Category -eq 'high_value_file' -or $Finding.Category -eq 'CREDENTIAL_LEAD/zip_container')) { return $true }
     $p = $Finding.Path.Replace('\','/').ToLowerInvariant()
@@ -4471,6 +4500,7 @@ function Write-CleanSummary {
         ((Test-CleanCommentedFinding -Finding $_) -or
          (Test-CleanExamplePath -Path $_.Path) -or
          (Test-CleanContextPath -Path $_.Path)) -and
+        -not (Test-CleanInstalledPythonRuntimeNoise -Finding $_) -and
         -not (Test-CleanPandoraSourceNoise -Finding $_) -and
         -not (Test-CleanJoomlaSourceNoise -Finding $_) -and
         -not (Test-CleanRuntimeReferenceFinding -Finding $_) -and
