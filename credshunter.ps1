@@ -2655,7 +2655,14 @@ namespace CredsHunter {
 '@ -ErrorAction Stop
         } catch { return @() }
     }
-    try { return ,([CredsHunter.NativeCredentials]::Enumerate()) } catch { return @() }
+    try {
+        # Enumerate the generic List explicitly. Unary-comma wrapping here used
+        # to emit the List itself as one pipeline object, so callers observed a
+        # synthetic entry with empty Target/UserName/Type/Persist and never saw
+        # the NativeCredentialEntry objects contained in the list.
+        $nativeEntries = [CredsHunter.NativeCredentials]::Enumerate()
+        foreach ($nativeEntry in $nativeEntries) { Write-Output $nativeEntry }
+    } catch { return @() }
 }
 
 function ConvertFrom-CredentialBlob { param([byte[]]$Blob)
