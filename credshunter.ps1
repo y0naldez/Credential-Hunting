@@ -59,6 +59,10 @@
 .PARAMETER Quiet
     Reduce status noise. Findings still printed.
 
+.PARAMETER StatusIntervalSeconds
+    Seconds between plain-text progress heartbeats. Default 5. These remain
+    visible in remote shells that do not render PowerShell Write-Progress.
+
 .PARAMETER NoColor
     Strip ANSI colour codes.
 
@@ -117,6 +121,9 @@ param(
 
     [switch] $Quiet,
 
+    [ValidateRange(1, 3600)]
+    [int] $StatusIntervalSeconds = 5,
+
     [switch] $Clean,
 
     [switch] $NoColor,
@@ -125,7 +132,7 @@ param(
     [switch] $Help
 )
 
-$script:Version = '2.6.0'
+$script:Version = '2.6.1'
 
 # Minimalistic, Linux-style usage. Shown for -Help / -h and when the script is
 # run with no parameters at all. (Get-Help .\credshunter.ps1 still gives the full
@@ -147,6 +154,8 @@ Usage: .\credshunter.ps1 -Path <dir>[,<dir>] [options]
   -SkipSystem          Skip stage 1 (OS checks); alias -NoStage1
   -NoStage1..5         Skip an individual stage
   -Quiet               Reduce status noise
+  -StatusIntervalSeconds <n>
+                       Plain-text heartbeat interval (default 5 seconds)
   -Clean               Console-friendly final summary, suppress stage detail
   -NoColor             Strip colour codes
   -Help                Show this help (-h)
@@ -1199,6 +1208,61 @@ function Write-Info { param([string]$Msg) if (-not $Quiet) { Write-Host "$($scri
 function Write-Ok   { param([string]$Msg) if (-not $Quiet) { Write-Host "$($script:CG)[+]$($script:CNC) $Msg" } }
 function Write-Warn { param([string]$Msg) Write-Host "$($script:CY)[!]$($script:CNC) $Msg" }
 function Write-Err  { param([string]$Msg) Write-Host "$($script:CR)[x]$($script:CNC) $Msg" }
+
+# Write-Progress is not reliably rendered by reverse shells, WinRM relays, or
+# redirected hosts. These plain-text heartbeats deliberately use Write-Host and
+# flush stdout so an operator can distinguish a slow full-disk walk from a hung
+# process. A phase with a known total also reports a best-effort ETA.
+$script:StatusPhaseStart = [DateTime]::UtcNow
+$script:LastStatusWrite  = [DateTime]::MinValue
+
+function Format-StatusDuration { param([double]$Seconds)
+    if ($Seconds -lt 0 -or [double]::IsNaN($Seconds) -or [double]::IsInfinity($Seconds)) { return '--:--' }
+    $span = [TimeSpan]::FromSeconds([Math]::Round($Seconds))
+    if ($span.TotalDays -ge 1) { return ('{0}d {1:00}:{2:00}:{3:00}' -f [int]$span.TotalDays, $span.Hours, $span.Minutes, $span.Seconds) }
+    if ($span.TotalHours -ge 1) { return ('{0:00}:{1:00}:{2:00}' -f [int]$span.TotalHours, $span.Minutes, $span.Seconds) }
+    return ('{0:00}:{1:00}' -f [int]$span.TotalMinutes, $span.Seconds)
+}
+
+function Start-StatusPhase { param([string]$Phase, [string]$Current = '')
+    $script:StatusPhaseStart = [DateTime]::UtcNow
+    $script:LastStatusWrite = [DateTime]::MinValue
+    Write-StatusHeartbeat -Phase $Phase -Current $Current -Force
+}
+
+function Write-StatusHeartbeat {
+    param(
+        [string]$Phase,
+        [long]$Completed = -1,
+        [long]$Total = -1,
+        [string]$Current = '',
+        [switch]$Force
+    )
+    if ($Quiet) { return }
+    $now = [DateTime]::UtcNow
+    if (-not $Force -and ($now - $script:LastStatusWrite).TotalSeconds -lt $StatusIntervalSeconds) { return }
+    $script:LastStatusWrite = $now
+    $elapsed = ($now - $script:StatusPhaseStart).TotalSeconds
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add($Phase)
+    $parts.Add(('elapsed {0}' -f (Format-StatusDuration $elapsed)))
+    if ($Completed -ge 0 -and $Total -gt 0) {
+        $percent = [Math]::Min(100, [Math]::Floor(($Completed * 100.0) / $Total))
+        $parts.Add(('{0}/{1} ({2}%)' -f $Completed, $Total, $percent))
+        if ($Completed -gt 0 -and $Completed -lt $Total) {
+            $etaSeconds = ($elapsed / $Completed) * ($Total - $Completed)
+            $parts.Add(('ETA {0}' -f (Format-StatusDuration $etaSeconds)))
+        }
+    } elseif ($Completed -ge 0) {
+        $parts.Add(('{0} files; total pending' -f $Completed))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Current)) {
+        if ($Current.Length -gt 120) { $Current = '...' + $Current.Substring($Current.Length - 117) }
+        $parts.Add($Current)
+    }
+    Write-Host ("$($script:CB)[~]$($script:CNC) " + ($parts -join ' | '))
+    try { [Console]::Out.Flush() } catch {}
+}
 
 # Stream a single Stage-1 finding to the host as it is recorded.
 function Write-Stage1Finding {
@@ -3900,6 +3964,7 @@ function Get-WalkedFiles { param([string[]]$Paths)
     # directory find-data (no extra stat), so Size is populated essentially for free.
     $result = [System.Collections.Generic.List[object]]::new()
     $stack  = [System.Collections.Generic.Stack[string]]::new()
+    Start-StatusPhase -Phase 'Enumerating filesystem' -Current ($Paths -join ', ')
     foreach ($r in $Paths) {
         try { $abs = [System.IO.Path]::GetFullPath($r) } catch { Write-Warn "Invalid path: $r"; continue }
         if (-not (Test-Path -LiteralPath $abs)) { Write-Warn "Path does not exist: $abs"; continue }
@@ -3922,8 +3987,10 @@ function Get-WalkedFiles { param([string[]]$Paths)
         $stack.Push($abs)
     }
     $walkCount = 0
+    $directoryCount = 0
     while ($stack.Count -gt 0) {
         $current = $stack.Pop()
+        $directoryCount++
         try {
             foreach ($info in (New-Object System.IO.DirectoryInfo $current).EnumerateFileSystemInfos()) {
                 if ($info -is [System.IO.DirectoryInfo]) {
@@ -3933,23 +4000,35 @@ function Get-WalkedFiles { param([string[]]$Paths)
                         Path = $info.FullName; Name = $info.Name.ToLowerInvariant()
                         Ext  = $info.Extension.ToLowerInvariant(); Size = $info.Length })
                     $walkCount++
-                    if (-not $Quiet -and ($walkCount % 20000) -eq 0) {
-                        Write-Host ("  $($script:CD)[*] enumerated $walkCount files...$($script:CNC)")
+                    # Avoid a function/clock call for every file on very large
+                    # trees while still checking often enough for a 1s interval.
+                    if (($walkCount % 128) -eq 0) {
+                        Write-StatusHeartbeat -Phase ("Enumerating filesystem ({0} dirs, {1} queued)" -f $directoryCount, $stack.Count) `
+                            -Completed $walkCount -Current $current
                     }
                 }
             }
         } catch {}
     }
+    Write-StatusHeartbeat -Phase ("Filesystem enumeration complete ({0} dirs)" -f $directoryCount) `
+        -Completed $walkCount -Total $walkCount -Force
     return ,$result
 }
 
 # Stage 2 - confirmed credential containers (extension == proof)
 function Find-GuaranteedCredentials { param($Files)
+    $total = @($Files).Count; $i = 0
+    Start-StatusPhase -Phase 'Stage 2: checking credential containers'
     foreach ($f in $Files) {
+        $i++
         if ($script:Stage2ExtensionsSet.Contains($f.Ext)) {
             Add-Guaranteed -Extension $f.Ext.TrimStart('.') -Path $f.Path
         }
+        if (($i % 512) -eq 0) {
+            Write-StatusHeartbeat -Phase 'Stage 2: checking credential containers' -Completed $i -Total $total -Current $f.Path
+        }
     }
+    Write-StatusHeartbeat -Phase 'Stage 2 complete' -Completed $i -Total $total -Force
 }
 
 # Stage 3 - high-value file types (NEW SPEC)
@@ -3959,7 +4038,13 @@ function Find-GuaranteedCredentials { param($Files)
 #   $script:Stage3GlobPatterns  -- wildcard match (PowerShell -like)
 # Files already flagged by Stage 2 are deduped via $script:GuaranteedHashes.
 function Find-HighValueFiles { param($Files)
+    $total = @($Files).Count; $i = 0
+    Start-StatusPhase -Phase 'Stage 3: checking high-value files'
     foreach ($f in $Files) {
+        $i++
+        if (($i % 64) -eq 0) {
+            Write-StatusHeartbeat -Phase 'Stage 3: checking high-value files' -Completed $i -Total $total -Current $f.Path
+        }
         # Stage 2 dedup
         if ($script:GuaranteedHashes.Contains($f.Path)) { continue }
         # SQL Server system-DB filter (always skip). SkipDbFilenames /
@@ -4018,6 +4103,7 @@ function Find-HighValueFiles { param($Files)
             }
         }
     }
+    Write-StatusHeartbeat -Phase 'Stage 3 complete' -Completed $i -Total $total -Force
 }
 
 # Stage 4 - filename substring search (NEW SPEC)
@@ -4037,7 +4123,13 @@ function Find-SuspiciousNames { param($Files)
     $selfName = if ($script:SelfPath) { [System.IO.Path]::GetFileName($script:SelfPath).ToLowerInvariant() } else { '' }
     $tokens = @($script:Stage4NameTokens | ForEach-Object { $_.ToLowerInvariant() })
 
+    $total = @($Files).Count; $i = 0
+    Start-StatusPhase -Phase 'Stage 4: checking filenames'
     foreach ($e in $Files) {
+        $i++
+        if (($i % 512) -eq 0) {
+            Write-StatusHeartbeat -Phase 'Stage 4: checking filenames' -Completed $i -Total $total -Current $e.Path
+        }
         # Dedup against Stage 2: a confirmed container (passwords.kdbx,
         # secrets.ppk, ...) is already [CRITICAL]; don't also down-tag it to a
         # mere [NAME] substring hit.
@@ -4048,6 +4140,7 @@ function Find-SuspiciousNames { param($Files)
             if ($e.Name.Contains($t)) { Add-SuspiciousName -Path $e.Path; break }
         }
     }
+    Write-StatusHeartbeat -Phase 'Stage 4 complete' -Completed $i -Total $total -Force
 }
 
 # Stage 5 - recursive file-content scan. Selects content-scan candidates from
@@ -4099,9 +4192,11 @@ function Invoke-UserPathScan { param($Files)
     }
     $mode = if ($All) { 'all' } else { 'extensions' }
     Write-Ok "Candidate files: $($script:CW)$total$($script:CNC)  (mode: $mode)"
+    Start-StatusPhase -Phase 'Stage 5: scanning file contents'
     $i = 0
     foreach ($f in $cands) {
         $i++
+        Write-StatusHeartbeat -Phase 'Stage 5: scanning file contents' -Completed $i -Total $total -Current $f.Path
         # Throttled progress. Truncate long paths so the progress bar doesn't
         # blow out terminal width with deep SQL Server / WindowsApps paths.
         if (($i % 25) -eq 0 -or $i -eq $total) {
@@ -4115,6 +4210,7 @@ function Invoke-UserPathScan { param($Files)
         Invoke-ScanFile -FullPath $f.Path -SourceLabel 'content' -KnownSize $f.Size
     }
     Write-Progress -Activity "Scanning files for credentials" -Completed
+    Write-StatusHeartbeat -Phase 'Stage 5 complete' -Completed $total -Total $total -Force
 }
 
 # ============================================================================
@@ -4766,6 +4862,8 @@ function Write-FullSummary {
 # ============================================================================
 
 function Invoke-Main {
+    $script:RunStartTime = [DateTime]::UtcNow
+    $script:RunCompleted = $false
     $script:LogPath = $null
     if ($OutputFile) {
         try {
@@ -4788,6 +4886,12 @@ function Invoke-Main {
             Write-Err "Cannot write to $OutputFile : $_"
             exit 2
         }
+    }
+
+    if ($script:LogPath) {
+        Write-LogLine ""
+        Write-LogLine ("=== credshunter v{0} run started {1} (PID {2}) ===" -f `
+            $script:Version, (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz'), $PID)
     }
 
     Write-Banner
@@ -4853,6 +4957,11 @@ function Invoke-Main {
         if ($Clean) { Write-CleanSummary } else { Write-FullSummary }
     }
 
+    $script:RunCompleted = $true
+    $runElapsed = ([DateTime]::UtcNow - $script:RunStartTime).TotalSeconds
+    Write-LogLine ("=== run completed in {0} ===" -f (Format-StatusDuration $runElapsed))
+    Write-Ok ("Scan completed in {0}." -f (Format-StatusDuration $runElapsed))
+
     $actionable = if ($Clean) {
         $script:CleanActionableCount
     } else {
@@ -4870,12 +4979,14 @@ try {
     Invoke-Main
 } catch [System.Management.Automation.PipelineStoppedException] {
     try { Write-Progress -Activity '*' -Completed } catch {}
+    try { Write-LogLine ("=== run interrupted after {0} ===" -f (Format-StatusDuration (([DateTime]::UtcNow - $script:RunStartTime).TotalSeconds))) } catch {}
     Write-Host ""
     Write-Warn "Interrupted by user. Exiting."
     exit 130
 } catch {
     try { Write-Progress -Activity '*' -Completed } catch {}
     if ($_.Exception.GetType().FullName -match 'Stopped|Cancel|Interrupt') {
+        try { Write-LogLine ("=== run interrupted after {0} ===" -f (Format-StatusDuration (([DateTime]::UtcNow - $script:RunStartTime).TotalSeconds))) } catch {}
         Write-Host ""
         Write-Warn "Interrupted by user. Exiting."
         exit 130

@@ -243,6 +243,18 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\credshunter.ps1 `
   -Path D:\ -IncludeData
 ```
 
+En Windows, el script muestra un latido de estado en texto plano cada 5
+segundos durante el recorrido del sistema de archivos y las etapas 2-5. Este
+mensaje sí se ve en shells inversas y relays remotos donde `Write-Progress` no
+se renderiza. Cuando ya se conoce el total, incluye contador, porcentaje,
+tiempo transcurrido, ruta actual y tiempo restante estimado. Usa
+`-StatusIntervalSeconds N` para cambiar el intervalo o `-Quiet` para ocultarlo.
+
+Con `-OutputFile`, el log recibe inmediatamente una marca de inicio con fecha,
+hora y PID; al terminar o interrumpirse recibe otra marca. Así se distingue una
+ejecución actual de resultados antiguos. Durante el recorrido inicial de `C:\`
+no hay ETA porque todavía no se conoce la cantidad total de archivos.
+
 No es obligatorio usar `root` o Administrador, pero los privilegios elevados permiten leer más perfiles y ubicaciones protegidas.
 
 ## Opciones principales

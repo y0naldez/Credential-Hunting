@@ -191,6 +191,19 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\credshunter.ps1 -Path 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\credshunter.ps1 -Path D:\ -IncludeData
 ```
 
+The Windows scanner prints plain-text heartbeats every 5 seconds during the
+filesystem walk and stages 2-5. This remains visible in reverse shells and
+remote relays where PowerShell's graphical `Write-Progress` display is not.
+Once the total is known, the heartbeat includes count, percentage, elapsed
+time, current path, and an estimated time remaining. Set a different interval
+with `-StatusIntervalSeconds N`, or suppress heartbeats with `-Quiet`.
+
+When `-OutputFile` is used, a run-start marker (timestamp and PID) is written
+immediately and a completion or interruption marker is appended at the end.
+This lets you distinguish the current run from older findings in an existing
+log. During the initial filesystem walk an ETA is not available because the
+total number of files is not known yet.
+
 You do not need to be privileged to run it. Running as Administrator or root only increases what the OS allows the script to read.
 
 ## Output Modes
