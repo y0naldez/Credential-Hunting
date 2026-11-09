@@ -132,7 +132,7 @@ param(
     [switch] $Help
 )
 
-$script:Version = '2.6.2'
+$script:Version = '2.6.3'
 
 # Minimalistic, Linux-style usage. Shown for -Help / -h and when the script is
 # run with no parameters at all. (Get-Help .\credshunter.ps1 still gives the full
@@ -4307,6 +4307,10 @@ function Test-CleanRuntimeReferenceFinding { param([object]$Finding)
     $rhs = ($preview -replace '^[^=]*=', '').Trim()
 
     if ($label -match '/(?:curl_basic|mysql_cmd)$' -and $preview -match '\$[A-Za-z_]\w*') { return $true }
+    # Empty/null declarations and format-string placeholders describe an API or
+    # runtime slot; they do not contain a reusable value.
+    if ($rhs -match '^(?:null|undef|nil|none|[''"]{2})\s*[;,]?$') { return $true }
+    if ($preview -match '(?i)\b(?:password|passwd|passphrase|pwd|secret)\w*\s*=\s*(?:null|undef|nil|none)\b') { return $true }
     if ($rhs -match '^(?:\([^)]*\)\s*)?\$[A-Za-z_]\w*(?:->|\.)') { return $true }
     if ($rhs -match '^(?:\([^)]*\)\s*)?\$[A-Za-z_]\w*(?:\[[^]]+\])?\s*[;,]?$') { return $true }
     if ($rhs -match '^[A-Za-z_]\w*(?:::|->)[A-Za-z_]\w*\s*\(') { return $true }
@@ -4316,6 +4320,12 @@ function Test-CleanRuntimeReferenceFinding { param([object]$Finding)
     if ($rhs -match '(?i)->\s*(?:get|read|load|fetch)\w*(?:password|passwd|passphrase|pwd|secret)\w*\s*\(') { return $true }
     if ($rhs -match '(?i)(?:^|[^A-Za-z0-9_])(?:substitute_vars|hash_password|get_user_password)\s*\(') { return $true }
     if ($rhs -match '(?i)(?:^|::|->)(?:get_input_string|get_instance|get)\s*\(') { return $true }
+    if ($preview -match '(?i)^\s*\$?[A-Za-z_]\w*(?:password|passwd|passphrase|pwd|secret)\w*\s*=\s*(?:(?:\([^)]*\)|!)\s*)?(?:split\b|cryptpw\b|hash\s*\().*\$[A-Za-z_]') { return $true }
+    if ($preview -match '(?i)\b(?:password|passwd|passphrase|pwd|secret)\w*\s*=\s*[''"]?\$[A-Za-z_]\w*') { return $true }
+    if ($preview -match '(?i)\b(?:password|passwd|passphrase|pwd|secret)\w*\s*=\s*(?:isset|empty|!empty)\s*\([^;]+\?[^;]+:\s*(?:null|[''"]{2})') { return $true }
+    if ($preview -match '(?i)\$[A-Za-z_]\w*(?:password|passwd|passphrase|pwd|secret)\w*\s*=\s*db_connect\s*\(') { return $true }
+    if ($preview -match '(?i)\b(?:is_md5|cryptpw|hash_password)\s*\(\s*\$[A-Za-z_]\w*(?:password|passwd|pwd)\w*') { return $true }
+    if ($preview -match '(?i)(?:password|passwd|pwd)\s*=\s*[''"]\$[A-Za-z_]\w*[''"]') { return $true }
     # Source-code expressions that describe or transform a password variable
     # are not reusable credentials. These forms are common in Joomla's update
     # extractor and media manager.
@@ -4328,6 +4338,38 @@ function Test-CleanRuntimeReferenceFinding { param([object]$Finding)
     if ($preview -match '(?i)[''"](?:password|passwd|pwd)[''"]\s*=>\s*[''"](?:active)?passwordfield[''"]') { return $true }
     if ($preview -match '(?i)[''"](?:password|passwd|pwd)[''"]\s*=>\s*[''"](?:text\s+not\s+null|string\()') { return $true }
     if ($preview -match '(?i)(?:type\s*=[>:]?\s*[''"]password[''"]|[''"]password[''"]\s*:\s*[''"]text[''"])') { return $true }
+    return $false
+}
+
+function Test-CleanXamppNoiseFinding { param([object]$Finding)
+    $p = ([string]$Finding.Path).Replace('\','/').ToLowerInvariant()
+    if ($p -notmatch '/xampp/') { return $false }
+    $preview = [string]$Finding.Preview
+
+    # MySQL's compiled message catalog contains translated printf templates,
+    # not captured passwords. Keep this exact catalog rule path- and
+    # placeholder-bound so ordinary files under mysql/share remain eligible.
+    if ($p -match '/xampp/mysql/share/errmsg-utf8[.]txt$' -and
+        $preview -match '%[-+0-9.]*[sdu]') { return $true }
+
+    # Documentation/examples embedded in the bundled command-line utilities.
+    if ($p -match '/xampp/mysql/bin/(?:mysqld_multi|mysqlhotcopy|mysql_convert_table_format)[.]pl$' -and
+        ($preview -match '(?i)--password=(?:[.]{3}|secretpassword)\b' -or
+         $preview -match '(?i)\$opt_password\s*=\s*undef\b')) { return $true }
+
+    if ($p -match '/xampp/php/pear/' -and (
+        $preview -match '(?i)^\s*\*.*(?:password for (?:the )?(?:user|username|login)|requires file::passwd|file::passwd(?:::\w+)?)\s*$' -or
+        $preview -match '(?i)^\s*(?:var\s+)?\$password\s*=\s*[''"]{2}\s*;' -or
+        $preview -match '(?i)^\s*\$proxy_pass\s*=\s*isset\([^;]+:\s*null\s*;' -or
+        $preview -match '(?i)^\s*(?:if\s*\(\$pwd\)|print).*\b(?:password|pwd)=[''"]?\.?\$[A-Za-z_]'
+    )) { return $true }
+
+    # Installer model declarations/documentation are schema, not deployed
+    # configuration. A concrete quoted value in the same file is not matched.
+    if ($p -match '/xampp/htdocs/[^/]+/src/install/config[.]php$' -and
+        ($preview -match '(?i)databasepassword\s*=\s*null\b' -or
+         $preview -match '(?i)^\s*\*.*databasepassword.*raw password')) { return $true }
+
     return $false
 }
 
@@ -4375,13 +4417,29 @@ function Test-CleanExamplePath { param([string]$Path)
     $p = $Path.Replace('\','/').ToLowerInvariant()
     return ($p -match '(?:^|[._-])(?:sample|dist|example|template)(?:[._-]|$)' -or
             $p -match '/(?:examples?|samples?|templates?)/' -or
+            $p -match '/xampp/contrib/' -or
             $p -match '/pandora_console/extras/sample_login[.]php$')
+}
+
+function Test-CleanVendorPath { param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $p = $Path.Replace('\','/').ToLowerInvariant()
+    return ($p -match '/xampp/php/pear/')
+}
+
+function Get-CleanBundledXamppTestRoot { param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    $p = $Path.Replace('\','/')
+    if ($p -match '(?i)^(?<root>.*?/xampp/php/pear/[^/]+/tests)(?:/|$)') { return $Matches['root'] }
+    if ($p -match '(?i)^(?<root>.*?/xampp/php/tests)(?:/|$)') { return $Matches['root'] }
+    return $null
 }
 
 function Test-CleanContextPath { param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     $p = $Path.Replace('\','/').ToLowerInvariant()
     return ($p -match '/(?:tests?|testdata|fixtures?|third_party|bower_components)/' -or
+            (Test-CleanVendorPath -Path $Path) -or
             $p -match '/assets/packages/' -or $p -match '/tmp/assets/' -or
             $p -match '/framework/(?:gii|cli/views/webapp)/')
 }
@@ -4417,6 +4475,7 @@ function Test-CleanNoiseFinding { param([object]$Finding)
     if (Test-CleanNoisePath -Path $Finding.Path) { return $true }
     return ((Test-CleanCommentedFinding -Finding $Finding) -or
             (Test-CleanInstalledPythonRuntimeNoise -Finding $Finding) -or
+            (Test-CleanXamppNoiseFinding -Finding $Finding) -or
             (Test-CleanExamplePath -Path $Finding.Path) -or
             (Test-CleanContextPath -Path $Finding.Path) -or
             (Test-CleanPandoraSourceNoise -Finding $Finding) -or
@@ -4485,6 +4544,13 @@ function Test-CleanNoiseInterest {
     if ((Test-CleanContextPath -Path $Finding.Path) -and
         ($Finding.Category -eq 'high_value_file' -or $Finding.Category -eq 'CREDENTIAL_LEAD/zip_container')) { return $true }
     $p = $Finding.Path.Replace('\','/').ToLowerInvariant()
+
+    # Bundled ACE syntax-highlighter code and Gibbon's session cipher wrapper
+    # contain generic Decrypt(passwordVariable) calls but no ciphertext or
+    # locally reusable key material. Full mode retains these source references.
+    if ($Finding.Category -eq 'ENCRYPTED_CREDENTIAL_LEAD/decrypt_call_reference' -and
+        ($p -match '/xampp/htdocs/[^/]+/lib/ace/mode-php[.]js:' -or
+         $p -match '/xampp/htdocs/[^/]+/src/session/sessionencryption[.]php:')) { return $true }
 
     # Edge ships many SQLite databases inside User Data and ZIP-compatible
     # MSIX payloads inside its installed application trees. Magic-byte
@@ -4612,6 +4678,7 @@ function Write-CleanSummary {
          (Test-CleanExamplePath -Path $_.Path) -or
          (Test-CleanContextPath -Path $_.Path)) -and
         -not (Test-CleanInstalledPythonRuntimeNoise -Finding $_) -and
+        -not (Test-CleanXamppNoiseFinding -Finding $_) -and
         -not (Test-CleanPandoraSourceNoise -Finding $_) -and
         -not (Test-CleanJoomlaSourceNoise -Finding $_) -and
         -not (Test-CleanRuntimeReferenceFinding -Finding $_) -and
@@ -4619,7 +4686,9 @@ function Write-CleanSummary {
         -not (Test-CleanNoisePath -Path $_.Path) -and
         $_.Preview -notmatch '(?i)://\[[^]]*(password|passwd|pwd)[^]]*\]'
     } | Sort-Object Path, LineNumber, Label)
-    $commentedGroups = @($commented |
+    $bundledXamppTests = @($commented | Where-Object { $null -ne (Get-CleanBundledXamppTestRoot -Path $_.Path) })
+    $commentedDetail = @($commented | Where-Object { $null -eq (Get-CleanBundledXamppTestRoot -Path $_.Path) })
+    $commentedGroups = @($commentedDetail |
         Group-Object Label, Path, Preview |
         ForEach-Object {
             $first = $_.Group[0]
@@ -4633,6 +4702,17 @@ function Write-CleanSummary {
                 FirstLine = if ($lines.Count -gt 0) { $lines[0] } else { 0 }
             }
         } | Sort-Object Path, FirstLine, Label)
+    $bundledXamppTestGroups = @($bundledXamppTests |
+        Group-Object { Get-CleanBundledXamppTestRoot -Path $_.Path } |
+        ForEach-Object {
+            $ordered = @($_.Group | Sort-Object Path, LineNumber, Label)
+            [PSCustomObject]@{
+                Path = $_.Name.Replace('/', '\')
+                Occurrences = $ordered.Count
+                Files = @($ordered.Path | Sort-Object -Unique).Count
+                Examples = @($ordered | Select-Object -First 2)
+            }
+        } | Sort-Object Path)
 
     # Authentication material comes first so a long password list cannot bury
     # an extensionless private key such as ~/.ssh/keys/root.
@@ -4688,12 +4768,24 @@ function Write-CleanSummary {
         } else { $f.Path }
         $prefix = if (Test-CleanExamplePath -Path $f.Path) {
             'example/'
+        } elseif (Test-CleanVendorPath -Path $f.Path) {
+            'vendor/'
         } elseif (Test-CleanContextPath -Path $f.Path) {
             'context/'
         } else { 'commented/' }
         $label = $prefix + ($f.Label -replace '^[^/]+/', '')
         Write-CleanLine ("  $($script:CY)[LEAD]$($script:CNC) {0}  $($script:CD){1}$($script:CNC)" -f $label, $location)
         if ($f.Preview) { Write-CleanLine ("         $($script:CD){0}$($script:CNC)" -f $f.Preview) }
+    }
+
+    Write-CleanFindings -Title "Bundled test credential leads" -Items $bundledXamppTestGroups -Renderer {
+        param($g)
+        Write-CleanLine ("  $($script:CY)[LEAD]$($script:CNC) vendor_test  $($script:CD){0}$($script:CNC)" -f $g.Path)
+        Write-CleanLine ("         $($script:CD){0} credential-like matches across {1} bundled test file(s); showing {2} example(s).$($script:CNC)" -f $g.Occurrences, $g.Files, $g.Examples.Count)
+        foreach ($example in $g.Examples) {
+            $lineText = if ($example.LineNumber -gt 0) { ": line $($example.LineNumber)" } else { '' }
+            Write-CleanLine ("         $($script:CD)- {0}{1}: {2}$($script:CNC)" -f $example.Path, $lineText, $example.Preview)
+        }
     }
 
     $specificInterestPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)

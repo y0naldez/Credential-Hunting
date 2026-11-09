@@ -212,6 +212,14 @@ oculta detrás de un límite de presentación. Las credenciales idénticas que s
 repiten en el mismo archivo se muestran una vez con todas sus líneas y el total
 de apariciones.
 
+En Windows, el modo limpio reconoce los ejemplos incluidos con XAMPP, el código
+de proveedor de PEAR/ADODB, las plantillas de mensajes de MySQL y las suites de
+prueba de PHP sin excluir sus directorios del escaneo. Los valores concretos de
+`xampp\contrib` y PEAR permanecen visibles como leads para revisión, los
+resultados de tests incluidos se agrupan y los secretos desplegados bajo
+`xampp\htdocs` conservan su prioridad. El modo completo mantiene todos los
+matches originales.
+
 La detección de llaves se basa en el contenido, no sólo en el nombre: un archivo
 sin extensión como `~/.ssh/keys/root` se clasifica como `[KEY]` si contiene una
 cabecera privada real. Las cadenas PEM incrustadas dentro de código fuente y los
