@@ -132,7 +132,7 @@ param(
     [switch] $Help
 )
 
-$script:Version = '2.6.1'
+$script:Version = '2.6.2'
 
 # Minimalistic, Linux-style usage. Shown for -Help / -h and when the script is
 # run with no parameters at all. (Get-Help .\credshunter.ps1 still gives the full
@@ -173,6 +173,14 @@ if ($Help -or $PSBoundParameters.Count -eq 0) {
 
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference    = 'Continue'
+
+# Emit the earliest possible plain-text signal. PowerShell must still parse the
+# file (and the host may submit it to AMSI) before any script code can run, but
+# this confirms execution before the large rule tables and scan state are built.
+if (-not $Quiet) {
+    Write-Host "[~] credshunter v$($script:Version) loaded; initializing scanner..."
+    try { [Console]::Out.Flush() } catch {}
+}
 
 # Stage-skip booleans: -SkipSystem is the legacy alias for -NoStage1.
 $script:Stage1Skip = $SkipSystem.IsPresent -or $NoStage1.IsPresent
@@ -4864,6 +4872,8 @@ function Write-FullSummary {
 function Invoke-Main {
     $script:RunStartTime = [DateTime]::UtcNow
     $script:RunCompleted = $false
+    Write-Banner
+    Start-StatusPhase -Phase 'Preparing scan and output' -Current $(if ($OutputFile) { $OutputFile } else { 'console only' })
     $script:LogPath = $null
     if ($OutputFile) {
         try {
@@ -4893,8 +4903,6 @@ function Invoke-Main {
         Write-LogLine ("=== credshunter v{0} run started {1} (PID {2}) ===" -f `
             $script:Version, (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz'), $PID)
     }
-
-    Write-Banner
 
     if ($script:SkipLarge) {
         Write-Info ("Size cap: skipping files larger than $($script:CW){0} MB$($script:CNC)  (use -MaxFileSizeMB N or -NoSizeLimit)" -f $MaxFileSizeMB)
