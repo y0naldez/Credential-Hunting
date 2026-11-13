@@ -66,6 +66,16 @@ Stage 1 revisa `ImagePath`, `ObjectName` y los valores de texto de la subclave `
 
 Las contraseñas configuradas normalmente mediante el Service Control Manager se almacenan como secretos LSA protegidos. CredsHunter no intenta extraerlas y no debe interpretarse una cuenta de servicio como prueba de que su contraseña esté disponible en texto claro.
 
+### Lansweeper
+
+En Windows, Stage 1 comprueba las rutas de instalación habituales de Lansweeper
+para localizar la cadena de conexión a la base de datos protegida con DPAPI en
+`Website\web.config` y el material de cifrado de la aplicación en
+`Key\Encryption.txt`. El análisis recursivo también reconoce ambos artefactos
+si Lansweeper está instalado en una ruta no estándar. Se reportan como pistas
+cifradas o de recuperación, no como contraseñas en texto claro; CredsHunter no
+descifra ni modifica los archivos.
+
 ### PuTTY y credenciales guardadas de Windows
 
 Stage 1 revisa sesiones PuTTY y KiTTY en `HKCU` y en todos los hives de usuario

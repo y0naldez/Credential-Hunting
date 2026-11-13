@@ -320,7 +320,7 @@ $script:RawPatterns = @(
        # Treat those escapes as boundaries so "\tPassword: value" is not
        # misread as the identifier "tPassword" and silently skipped. An
        # escaped JSON quote (\") may be part of the password, not its delimiter.
-       Regex = '(?im)(^|\\[nrt]|[^A-Za-z_])(password|passwd|passphrase|pwd)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s"#<>{}]){3,}' }
+       Regex = '(?im)(^|\\[nrt]|[^A-Za-z_])(password|passwd|passphrase|pwd)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s;"#<>{}]){3,}' }
 
     # Natural-language disclosure in mail, tickets, notes, and chat exports.
     # A quoted, whitespace-free token avoids prose such as "password is stored".
@@ -331,11 +331,11 @@ $script:RawPatterns = @(
 
     # ---- DB / service-prefixed passwords ------------------------------------
     @{ Label = 'db_password';
-       Regex = '(?im)(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|cifs)[_-]?(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s"#<>{}]){3,}' }
+       Regex = '(?im)(db|database|mysql|psql|pg|postgres|mongo|mssql|sql|sa|dba|oracle|redis|memcache|ldap|smtp|smb|ftp|sftp|imap|pop3|admin|user|service|svc|jenkins|jboss|tomcat|nexus|gitlab|jira|svn|backup|root|wp|wordpress|joomla|drupal|magento|laravel|django|proxy|vpn|cifs)[_-]?(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s;"#<>{}]){3,}' }
     # Any identifier ending in _password/_pass/_pwd (OpenStack keystone_password,
     # nova_password, app_password, mail_pass, ...). Value FP filter prunes refs.
     @{ Label = 'prefixed_password';
-       Regex = '(?im)[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s"#<>{}]){3,}' }
+       Regex = '(?im)[A-Za-z][A-Za-z0-9]*_(password|passwd|passphrase|pwd|pass)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s;"#<>{}]){3,}' }
 
     # Whitespace-delimited Pandora FMS configuration directives. The scan loop
     # below accepts this pattern only for pandora_server.conf/pandora_agent.conf.
@@ -1697,6 +1697,31 @@ function Invoke-EncryptedSecretLeadDetection {
     }
 }
 
+# Lansweeper stores its database connection string as an ASP.NET protected
+# configuration section and keeps separate application encryption material in
+# Key\Encryption.txt.  Neither artifact contains a plaintext password, but the
+# pair is a high-value recovery path that generic password regexes miss.
+function Invoke-LansweeperCredentialArtifactDetection {
+    param([string]$FullPath, [string]$Content)
+    if ([string]::IsNullOrEmpty($Content) -or [string]::IsNullOrWhiteSpace($FullPath)) { return }
+
+    $normalizedPath = $FullPath.Replace('\','/').ToLowerInvariant()
+    if ($normalizedPath -match '/lansweeper/website/web[.]config$') {
+        if ($Content -match '(?i)configProtectionProvider\s*=\s*["'']DataProtectionConfigurationProvider["'']' -and
+            $Content -match '(?i)<EncryptedData\b' -and
+            $Content -match '(?is)<CipherValue>\s*[A-Za-z0-9+/]{40,}={0,2}\s*</CipherValue>') {
+            Add-EncryptedSecretLead -Kind 'lansweeper_connection_string' -Path $FullPath -LineNumber 0 `
+                -Reason 'DPAPI-protected Lansweeper database connection string'
+        }
+        return
+    }
+
+    if ($normalizedPath -match '/lansweeper/key/encryption[.]txt$' -and $Content.Trim().Length -gt 0) {
+        Add-Interesting -Category 'CREDENTIAL_LEAD/lansweeper_encryption_key' `
+            -Path ("{0} (local key material used to decrypt credentials stored in the Lansweeper database)" -f $FullPath)
+    }
+}
+
 function Invoke-DecryptableConfigLeadDetection {
     param([string]$FullPath, [string]$Content, [string]$SourceLabel = 'content')
     if ([string]::IsNullOrEmpty($Content)) { return }
@@ -2288,6 +2313,7 @@ function Invoke-ScanFile { param([string]$FullPath, [string]$SourceLabel = 'cont
     if ([string]::IsNullOrEmpty($content)) { return }
 
     Invoke-EncryptedSecretLeadDetection -FullPath $FullPath -Content $content
+    Invoke-LansweeperCredentialArtifactDetection -FullPath $FullPath -Content $content
     Invoke-DecryptableConfigLeadDetection -FullPath $FullPath -Content $content -SourceLabel $SourceLabel
     Invoke-SqlTextCredentialDetection -FullPath $FullPath -Content $content -SourceLabel $SourceLabel
 
@@ -3828,8 +3854,23 @@ function Test-AppSessionArtifacts {
     }
 }
 
+function Test-LansweeperArtifacts {
+    Write-Info "Stage 1.31 - Lansweeper encrypted connection string / database encryption key"
+    $roots = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($programFilesRoot in @(${env:ProgramFiles(x86)}, $env:ProgramFiles)) {
+        if ([string]::IsNullOrWhiteSpace($programFilesRoot)) { continue }
+        [void]$roots.Add((Join-Path $programFilesRoot 'Lansweeper'))
+    }
+
+    foreach ($root in $roots) {
+        Add-Checked -Label 'lansweeper_artifacts' -Path $root
+        Test-KnownFile -Path (Join-Path $root 'Website\web.config') -Label 'lansweeper_web_config'
+        Test-KnownFile -Path (Join-Path $root 'Key\Encryption.txt') -Label 'lansweeper_encryption_key'
+    }
+}
+
 function Test-WindowsServices {
-    Write-Info "Stage 1.31 - Windows service accounts / hardcoded command-line credentials"
+    Write-Info "Stage 1.32 - Windows service accounts / hardcoded command-line credentials"
     $root = 'HKLM:\SYSTEM\CurrentControlSet\Services'
     if (-not (Test-Path $root)) { return }
     Add-Checked -Label 'windows_services' -Path $root
@@ -3953,6 +3994,7 @@ function Invoke-SystemChecks {
     Invoke-Stage1Check { Test-AppServers }
     Invoke-Stage1Check { Test-DotNetUserSecrets }
     Invoke-Stage1Check { Test-AppSessionArtifacts }
+    Invoke-Stage1Check { Test-LansweeperArtifacts }
     Invoke-Stage1Check { Test-WindowsServices }
     $script:InStage1 = $false
 }

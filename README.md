@@ -80,6 +80,15 @@ being treated as confirmed passwords.
 Passwords managed normally by the Service Control Manager are stored as
 protected LSA secrets, so CredsHunter does not attempt to extract them.
 
+### Lansweeper
+
+On Windows, Stage 1 checks the standard Lansweeper installation roots for the
+DPAPI-protected database connection string in `Website\web.config` and the
+application encryption material in `Key\Encryption.txt`. Recursive scans also
+recognize these artifacts when Lansweeper is installed in a nonstandard root.
+They are reported as encrypted/recovery leads rather than plaintext passwords;
+CredsHunter does not decrypt or modify either file.
+
 ### PuTTY and saved Windows sessions
 
 The PowerShell scanner inspects PuTTY and KiTTY sessions in `HKCU` and every
