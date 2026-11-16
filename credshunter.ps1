@@ -322,6 +322,12 @@ $script:RawPatterns = @(
        # escaped JSON quote (\") may be part of the password, not its delimiter.
        Regex = '(?im)(^|\\[nrt]|[^A-Za-z_])(password|passwd|passphrase|pwd)["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s;"#<>{}]){3,}' }
 
+    # Short `pass` is common in ordinary prose and identifiers (bypass,
+    # compass), so keep it out of the broad assignment rule. Accept it only
+    # as the complete key at the start of a config/structured-data line.
+    @{ Label = 'short_pass_assign';
+       Regex = '(?im)^\s*["'']?pass["'']?\s*[:=]\s*["'']?(?:\\+"|[^\s;"#<>{}]){3,}' }
+
     # Natural-language disclosure in mail, tickets, notes, and chat exports.
     # A quoted, whitespace-free token avoids prose such as "password is stored".
     @{ Label = 'prose_password';
@@ -728,7 +734,10 @@ function Test-FalsePositive { param([string]$Value)
     if ($v -match '<%.*?%>')                      { return $true }
     if ($v -match '#\{[^}]+\}')                   { return $true }
     if ($v -match '<[A-Za-z_][^>]*>')             { return $true }
-    if ($v -match '%[A-Z_]+%')                    { return $true }
+    # A complete Windows %VARIABLE% token is a runtime reference. Embedded
+    # percent-delimited text can be part of a real password (for example
+    # YE%TJC%&HYbe5Nw), so do not discard the entire value in that case.
+    if ($v -match '^%[A-Z_][A-Z0-9_]*%$')         { return $true }
     # Value that IS a sed/awk positional backref ($1/$2/$3) or shell PID ($$) /
     # ${1}. Anchored to the WHOLE value so a real password merely CONTAINING $$
     # (e.g. P@$$w0rd!) is kept -- supports the "allow $ in passwords" change

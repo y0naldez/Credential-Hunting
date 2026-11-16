@@ -534,6 +534,11 @@ CRED_PATTERNS=(
     # Literal JSON \n / \r / \t escapes are credential-key boundaries too.
     'password_assign|(^|\\[nrt]|[^A-Za-z_])(password|passwd|passphrase|pwd)['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?([\\]+"|[^[:space:]"#$<>{}]){3,}'
 
+    # Short `pass` is common in ordinary prose and identifiers (bypass,
+    # compass), so keep it out of the broad assignment rule.  Accept it only
+    # as the complete key at the start of a config/structured-data line.
+    'short_pass_assign|^[[:space:]]*['"'"'"]?pass['"'"'"]?[[:space:]]*[:=][[:space:]]*['"'"'"]?([\\]+"|[^[:space:]"#$<>{}]){3,}'
+
     # Natural-language disclosure in mail, tickets, notes, and chat exports.
     # Require a quoted, whitespace-free token: this catches `the password is
     # "Secret123"` while rejecting prose such as `the password is stored in...`.
@@ -866,9 +871,12 @@ is_false_positive() {
         # fragment (for example P@$$w0rd); substring matching silently dropped
         # those real credentials on Linux while the PowerShell engine kept them.
         '$1'|'$2'|'$3'|'$$'|'${1}'|'${2}'|'${3}') return 0 ;;
-        *'%'[A-Z_]*'%'*) return 0 ;;
         *'@@'*|*'__'*'__'*) return 0 ;;
     esac
+    # A complete Windows %VARIABLE% token is a runtime reference. Embedded
+    # percent-delimited text can be part of a real password (for example
+    # YE%TJC%&HYbe5Nw), so do not discard the entire value in that case.
+    [[ "$v" =~ ^%[A-Z_][A-Z0-9_]*%$ ]] && return 0
 
     # Programming-language references that look like passwords but aren't
     # (Python `self.password`, Java `this.password`, PHP `$_POST['password']`)
