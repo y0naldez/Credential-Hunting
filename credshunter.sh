@@ -71,6 +71,9 @@ MAX_LINE_LEN=16384
 # The SQL correlation pass is additive, not a deep-database mode. Keep its
 # in-memory lexer bounded even when --no-size-limit is requested.
 MAX_SQL_STRUCTURED_BYTES=$((8 * 1024 * 1024))
+# Only the additional, non-privileged log path has an aggregate budget. The
+# existing root/adm/systemd-journal scan keeps its original coverage.
+UNPRIVILEGED_LOG_BUDGET_BYTES=$((64 * 1024 * 1024))
 # Stage-1 live-output state. When IN_STAGE1=1, the record_* helpers stream
 # each finding to stderr as it's discovered so the operator sees results in
 # real time. SUBSTAGE_FINDINGS is reset before each substage runs; if it is
@@ -618,6 +621,11 @@ CRED_PATTERNS=(
     # catches `&('"'"'…plink.exe'"'"') -pw '"'"'SECRET'"'"'`, `--password=X`, `/p:X`
     # which the tool-anchored patterns above miss.
     'cmdline_pw_flag|(^|[[:space:]])((-pw|--pw|-pass|--password)[[:space:]=]+['"'"'"]?[^[:space:]'"'"'"]{3,}|(/p:|/pass:|/password:)['"'"'"]?[^[:space:]'"'"'"]{3,})'
+    # Single-dash long options are common in custom scripts. Classification
+    # restricts this signature to command records in logs, avoiding generic
+    # -pwd/-password matches in documentation and configuration files. -pass
+    # also has an earlier generic rule, which keeps its existing classification.
+    'log_cmdline_password_flag|(^|[[:space:]])-(password|passwd|passphrase|pwd|pass)[[:space:]=]+['"'"'"]?[^[:space:]'"'"'"<>$]{3,}'
     'net_use_pass|net[[:space:]]+use[[:space:]]+.*[[:space:]]/user:[^[:space:]]+[[:space:]]+[^[:space:]/"]{3,}'
     # `net user john.doe "MySecurePassword" /domain` — local/domain user creation
     # `net user <user> <password> [/add|/domain|...]` — the trailing flag is
@@ -1621,6 +1629,10 @@ classify_line() {
                     *) return 1 ;;
                 esac
             fi
+            if [ "$label" = "log_cmdline_password_flag" ]; then
+                [ "$source_label" = "privileged_log" ] || continue
+                [[ "$content" =~ (CMD[[:space:]]*\(|COMMAND=|[Cc]ommand[[:space:]]*[:=]|[Aa]rgv[[:space:]]*[:=]) ]] || continue
+            fi
             # ── Commented example skip ───────────────────────────────────
             # Stock configs ship docs like `# snmpwalk -c public` or
             # `# rocommunity public` — examples, not live creds. Skip comment
@@ -1658,6 +1670,11 @@ classify_line() {
             # last quoted literal on the line as the value before FP-filtering
             # (e.g.  'password' => 'changeme'  ->  changeme).
             case "$label" in
+                log_cmdline_password_flag)
+                    if [[ "$matched_text" =~ -(password|passwd|passphrase|pwd|pass)[[:space:]=]+[\'\"]?([^[:space:]\'\"\<\>\$]+) ]]; then
+                        value="${BASH_REMATCH[2]}"
+                    fi
+                    ;;
                 prose_password)
                     if [[ "$matched_text" =~ [\'\"]([^[:space:]\'\"]{3,128})[\'\"] ]]; then
                         value="${BASH_REMATCH[1]}"
@@ -2619,26 +2636,70 @@ has_privileged_log_access() {
 
 check_privileged_text_logs() {
     # Logs are intentionally absent from the normal recursive / scan. In clean
-    # mode, however, an account with the usual privileged-log groups can extract
-    # high-value disclosures with much less noise than an unrestricted walk.
+    # mode, inspect readable log names through a separate, bounded-depth walk.
     [ "$CLEAN" -eq 1 ] || return 0
-    has_privileged_log_access || return 0
-
     local log_root="${CREDSHUNTER_LOG_ROOT:-/var/log}" f
     [ -d "$log_root" ] && [ -r "$log_root" ] || return 0
-    info "Stage 1.14 -- readable privileged text logs"
 
+    if has_privileged_log_access; then
+        info "Stage 1.14 -- readable privileged text logs"
+        # Preserve the existing privileged scan, including its file ordering
+        # and per-file size behavior.
+        while IFS= read -r -d '' f; do
+            [ -r "$f" ] || continue
+            case "${f,,}" in
+                *.gz|*.bz2|*.xz|*.zst|*.lz4|*.zip) continue ;;
+            esac
+            scan_file "$f" "privileged_log"
+        done < <(find "$log_root" -maxdepth 3 -type f \( \
+            -iname '*.log' -o -iname '*.log.[0-9]*' \
+            -o -iname 'auth.log*' -o -iname 'secure*' \
+            -o -iname 'syslog*' -o -iname 'messages*' \
+            \) -print0 2>/dev/null)
+        return
+    fi
+
+    # An ordinary user may still read individual files through the "other"
+    # mode bits or an ACL. Gather candidates with one bounded-depth walk, then
+    # inspect system/auth logs first so rotated syslog files are not crowded
+    # out by application logs. This budget applies only to the new path.
+    info "Stage 1.14 -- readable text logs (64 MB additional scan budget)"
+    # A single empty sentinel keeps Bash 4.2 with set -u happy when one class
+    # has no files (the project supports Bash 4+).
+    local -a priority_logs=("") other_logs=("")
     while IFS= read -r -d '' f; do
         [ -r "$f" ] || continue
         case "${f,,}" in
             *.gz|*.bz2|*.xz|*.zst|*.lz4|*.zip) continue ;;
+            */syslog*|*/auth.log*|*/secure*|*/messages*) priority_logs+=("$f") ;;
+            *) other_logs+=("$f") ;;
         esac
-        scan_file "$f" "privileged_log"
     done < <(find "$log_root" -maxdepth 3 -type f \( \
         -iname '*.log' -o -iname '*.log.[0-9]*' \
         -o -iname 'auth.log*' -o -iname 'secure*' \
         -o -iname 'syslog*' -o -iname 'messages*' \
         \) -print0 2>/dev/null)
+
+    local used=0 sz skipped_budget=0
+    for f in "${priority_logs[@]}" "${other_logs[@]}"; do
+        [ -n "$f" ] || continue
+        sz=$(file_size "$f")
+        [ "$sz" -gt 0 ] || continue
+        if [ "$SKIP_LARGE" -eq 1 ] && [ "$sz" -gt $((MAX_FILE_SIZE_MB * 1024 * 1024)) ]; then
+            record_skip "$f" "size>${MAX_FILE_SIZE_MB}MB"
+            continue
+        fi
+        if [ $((used + sz)) -gt "$UNPRIVILEGED_LOG_BUDGET_BYTES" ]; then
+            skipped_budget=$((skipped_budget + 1))
+            record_skip "$f" "non-privileged log scan budget"
+            continue
+        fi
+        used=$((used + sz))
+        scan_file "$f" "privileged_log"
+    done
+    if [ "$skipped_budget" -gt 0 ]; then
+        warn "Non-privileged log scan reached its 64 MB budget; $skipped_budget readable log(s) were not scanned."
+    fi
 }
 
 run_system_checks() {

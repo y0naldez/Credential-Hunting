@@ -56,10 +56,14 @@ benefit from targeted handling.
 ### Linux Local Artifacts
 
 Stage 1 scans readable local mbox files in `/var/mail` and `/var/spool/mail`.
-In `--clean` mode it also performs a bounded scan of readable plaintext logs
-under `/var/log` when the effective user is root or belongs to `adm` or
-`systemd-journal`. This includes ordinary rotated names such as
-`vsftpd.log.1`; compressed rotations remain excluded from plaintext inspection.
+In `--clean` mode it also scans readable plaintext logs under `/var/log`,
+including ordinary rotated names such as `syslog.2` and `vsftpd.log.1`.
+Compressed rotations remain excluded from plaintext inspection. Root and
+members of `adm` or `systemd-journal` retain the existing per-file size limit.
+For other users, the scan checks each file's readability, scans system/auth logs
+first, and limits the additional scan to 64 MB total; it reports files omitted
+when that budget is reached. Command records in logs also recognize single-dash
+`-password`, `-passwd`, `-passphrase`, and `-pwd` options.
 Aliased spools and hard links are deduplicated by file identity, while
 unreadable mailboxes are counted as skipped without stopping the hunt..
 

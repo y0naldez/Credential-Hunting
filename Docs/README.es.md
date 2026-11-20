@@ -54,6 +54,14 @@ Los spools enlazados o con hard links se deduplican por la identidad del
 archivo, mientras que los buzones sin permisos se contabilizan como omitidos
 sin interrumpir el análisis.
 
+En modo `--clean`, Stage 1 también revisa logs de texto legibles bajo
+`/var/log`, incluidos archivos rotados como `syslog.2`. Para usuarios fuera de
+`adm` y `systemd-journal`, examina primero los logs de sistema y autenticación
+y limita este análisis adicional a 64 MB en total; avisa si omite archivos por
+ese límite. La ruta de root y de esos grupos conserva su comportamiento previo.
+Los registros de comandos reconocen opciones `-password`, `-passwd`,
+`-passphrase` y `-pwd` sin aplicar ese patrón nuevo a archivos comunes.
+
 También analiza el contenido de los archivos ocultos regulares situados
 directamente en cada home. Los nombres inusuales como `.~`, los dotfiles muy
 cortos y los nombres ocultos relacionados con credenciales se conservan como
